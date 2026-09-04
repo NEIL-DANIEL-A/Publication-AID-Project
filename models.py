@@ -33,6 +33,19 @@ class ScopusVerificationResult:
 
 
 @dataclass
+class MJLVerificationResult:
+    """Result of a Clarivate Master Journal List (MJL) lookup for a single journal."""
+    mjl_status: str                     # "Found", "Not Found", "Unable to Verify"
+    mjl_index: str = "no data"          # e.g. "SCIE", "SSCI", "ESCI", "AHCI", or "no data"
+    mjl_issn_used: str = "no data"      # Which ISSN was searched
+    mjl_match_type: str = "No Match"    # "Print ISSN", "E-ISSN", "No Match"
+    mjl_source_title: str = "no data"   # Journal title from MJL response
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class JournalResult:
     issn: str
     journal_id: str

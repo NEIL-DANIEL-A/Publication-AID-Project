@@ -212,7 +212,8 @@ def run_source_only():
 def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     """
     Complete pipeline:
-    CFR collection -> Scopus Verification -> Filter (Active / Indexed) -> SCImago lookup -> Consolidated Excel.
+    CFR collection -> Scopus Verification -> MJL Verification (hybrid) -> SCImago lookup -> Consolidated Excel.
+    Filtering: Only Scopus Active / Indexed journals proceed to MJL and SCImago.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     pipeline_start = time.perf_counter()
@@ -254,11 +255,33 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"  Scopus Unable to Verify : {scopus_stats['unable_to_verify']}")
     print("-----------------------------------\n")
 
-    # Stage 3: Filtering & SCImago Enrichment
+    # Stage 3: MJL Index Verification (Clarivate Web of Science) - Hybrid
     eligible_pairs = [(j, s) for j, s in verified_pairs if s.scopus_status == "Active / Indexed"]
-    skipped_pairs = [(j, s) for j, s in verified_pairs if s.scopus_status != "Active / Indexed"]
+    skipped_pairs  = [(j, s) for j, s in verified_pairs if s.scopus_status != "Active / Indexed"]
 
-    print(f"[INFO] Stage 3: SCImago Enrichment (Eligible Active/Indexed: {len(eligible_pairs)} | Skipped: {len(skipped_pairs)})...")
+    print(f"[INFO] Stage 3: MJL Index Verification (Active/Indexed: {len(eligible_pairs)} journals)...")
+    mjl_start_time = time.perf_counter()
+
+    from scrapers.mjl import verify_mjl_indexing
+    mjl_triples = verify_mjl_indexing(eligible_pairs, headless=True, verbose=False, max_workers=workers)
+
+    mjl_duration = round(time.perf_counter() - mjl_start_time, 2)
+
+    mjl_found      = sum(1 for _, _, m in mjl_triples if m.mjl_status == "Found")
+    mjl_not_found  = sum(1 for _, _, m in mjl_triples if m.mjl_status == "Not Found")
+    mjl_unverified = sum(1 for _, _, m in mjl_triples if m.mjl_status == "Unable to Verify")
+
+    print(f"\n--- MJL Verification Summary ---")
+    print(f"  MJL Found           : {mjl_found}")
+    print(f"  MJL Not Found       : {mjl_not_found}")
+    print(f"  MJL Unable to Verify: {mjl_unverified}")
+    print(f"  MJL Stage Time      : {mjl_duration:.2f} sec")
+    print(f"--------------------------------\n")
+
+    mjl_lookup = {j.sl_no: m for j, _, m in mjl_triples}
+
+    # Stage 4: SCImago Enrichment (same eligible set)
+    print(f"[INFO] Stage 4: SCImago Enrichment (Eligible Active/Indexed: {len(eligible_pairs)} | Skipped: {len(skipped_pairs)})...")
 
     results = []
     scimago_attempted = 0
@@ -319,6 +342,12 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             scimago_url = "no data"
             is_success = False
 
+        m_res = mjl_lookup.get(j.sl_no)
+        mjl_status_val  = m_res.mjl_status       if m_res else "no data"
+        mjl_index_val   = m_res.mjl_index        if m_res else "no data"
+        mjl_issn_val    = m_res.mjl_issn_used    if m_res else "no data"
+        mjl_title_val   = m_res.mjl_source_title if m_res else "no data"
+
         record = {
             "Sl.No": j.sl_no,
             "Full Journal Title": j.journal_title,
@@ -332,6 +361,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             "Scopus Source Title": s_res.source_title,
             "Scopus Publisher": s_res.scopus_publisher,
             "Scopus Coverage": s_res.scopus_coverage,
+            "MJL Status": mjl_status_val,
+            "MJL Index": mjl_index_val,
+            "MJL Matched ISSN": mjl_issn_val,
+            "MJL Source Title": mjl_title_val,
             "SCImago Matched ISSN": matched_issn,
             "SCImago Journal ID": j_id,
             "SJR": sjr_val,
@@ -394,6 +427,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             "Scopus Source Title": s_res.source_title,
             "Scopus Publisher": s_res.scopus_publisher,
             "Scopus Coverage": s_res.scopus_coverage,
+            "MJL Status": "skipped",
+            "MJL Index": "skipped",
+            "MJL Matched ISSN": "skipped",
+            "MJL Source Title": "skipped",
             "SCImago Matched ISSN": "skipped",
             "SCImago Journal ID": "skipped",
             "SJR": "skipped",
@@ -410,12 +447,12 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
 
     # Write output to Excel
     out_df = pd.DataFrame(results)
-    out_path = os.path.join(OUTPUT_DIR, "cfr_scopus_scimago_results.xlsx")
+    out_path = os.path.join(OUTPUT_DIR, "cfr_scopus_mjl_scimago_results.xlsx")
     try:
         out_df.to_excel(out_path, index=False)
         saved_file = out_path
     except PermissionError:
-        alt_path = os.path.join(OUTPUT_DIR, "cfr_scopus_scimago_results_latest.xlsx")
+        alt_path = os.path.join(OUTPUT_DIR, "cfr_scopus_mjl_scimago_results_latest.xlsx")
         out_df.to_excel(alt_path, index=False)
         saved_file = alt_path
 
@@ -430,6 +467,11 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"  Scopus Not Indexed        : {scopus_stats['not_indexed']}")
     print(f"  Scopus Unable to Verify   : {scopus_stats['unable_to_verify']}")
     print()
+    print(f"MJL Verification (Active)   : {len(eligible_pairs)}")
+    print(f"  MJL Found                 : {mjl_found}")
+    print(f"  MJL Not Found             : {mjl_not_found}")
+    print(f"  MJL Unable to Verify      : {mjl_unverified}")
+    print()
     print(f"Sent to SCImago (Active)    : {len(eligible_pairs)}")
     print(f"Skipped from SCImago        : {len(skipped_pairs)}")
     print(f"  SCImago Successful        : {scimago_successful}")
@@ -439,6 +481,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"CFR collection time         : {cfr_duration:.2f} sec")
     print(f"Scopus initialization       : {scopus_init_time:.2f} sec")
     print(f"Scopus verification         : {scopus_verify_time:.4f} sec")
+    print(f"MJL stage time              : {mjl_duration:.2f} sec")
     print(f"SCImago stage time          : {scimago_duration:.2f} sec")
     print(f"TOTAL PIPELINE TIME         : {total_pipeline_time:.2f} sec ({round(total_pipeline_time / 60.0, 2)} min)")
     print("========================================\n")
