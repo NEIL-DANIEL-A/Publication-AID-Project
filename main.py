@@ -209,13 +209,16 @@ def run_source_only():
     return journals
 
 
-def run_complete_pipeline():
+def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     """
     Complete pipeline:
-    CFR collection -> ISSN normalization -> SCImago lookup (Print -> fallback E-ISSN) -> Final Excel.
+    CFR collection -> Scopus Verification -> Filter (Active / Indexed) -> SCImago lookup -> Consolidated Excel.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     pipeline_start = time.perf_counter()
+
+    if scopus_file is None:
+        scopus_file = os.path.join(OUTPUT_DIR, "scopus_source_title_list.xlsx")
 
     # Stage 1: CFR Collection
     print("[INFO] Stage 1: Starting CFR Data Collection...")
@@ -227,132 +230,229 @@ def run_complete_pipeline():
     report_duplicates(journals)
     print()
 
-    # Stage 2: SCImago Enrichment
-    print("[INFO] Stage 2: SCImago Enrichment (Print-ISSN with E-ISSN fallback)...")
+    # Stage 2: Scopus Verification
+    print("[INFO] Stage 2: Scopus Verification (via official Source Title List)...")
+    scopus_init_start = time.perf_counter()
+
+    from scrapers.scopus import verify_scopus_indexing
+    verified_pairs, scopus_stats = verify_scopus_indexing(journals, scopus_file)
+
+    scopus_init_time = scopus_stats["dataset_load_time"] + scopus_stats["construction_time"]
+    scopus_verify_time = scopus_stats["verification_time"]
+    print(
+        f"[INFO] Scopus Dataset Load: {scopus_stats['dataset_load_time']:.2f}s | "
+        f"Index Construction: {scopus_stats['construction_time']:.2f}s | "
+        f"Journal Verification: {scopus_verify_time:.4f}s"
+    )
+
+    print("\n--- Scopus Verification Summary ---")
+    print(f"Total CFR Journals        : {scopus_stats['total_journals']}")
+    print(f"  Scopus Active / Indexed : {scopus_stats['active_indexed']}")
+    print(f"  Scopus Inactive         : {scopus_stats['inactive']}")
+    print(f"  Scopus Discontinued     : {scopus_stats['discontinued']}")
+    print(f"  Scopus Not Indexed      : {scopus_stats['not_indexed']}")
+    print(f"  Scopus Unable to Verify : {scopus_stats['unable_to_verify']}")
+    print("-----------------------------------\n")
+
+    # Stage 3: Filtering & SCImago Enrichment
+    eligible_pairs = [(j, s) for j, s in verified_pairs if s.scopus_status == "Active / Indexed"]
+    skipped_pairs = [(j, s) for j, s in verified_pairs if s.scopus_status != "Active / Indexed"]
+
+    print(f"[INFO] Stage 3: SCImago Enrichment (Eligible Active/Indexed: {len(eligible_pairs)} | Skipped: {len(skipped_pairs)})...")
+
     results = []
     scimago_attempted = 0
     scimago_successful = 0
     scimago_failed = 0
-    journal_processing_times = []
+    scimago_duration = 0.0
+
+    scimago_start_time = time.perf_counter()
+
+    def process_eligible_pair(idx_pair, scraper_inst):
+        idx, (j, s_res) = idx_pair
+        j_start = time.perf_counter()
+
+        norm_print = normalize_issn(j.print_issn)
+        norm_e = normalize_issn(j.e_issn)
+
+        matched_issn = "no data"
+        scimago_res = None
+
+        # 1. Try Print-ISSN first
+        if norm_print != "no data":
+            res = scraper_inst.scrape_journal(norm_print)
+            if res.status in ["SUCCESS", "PARTIAL"]:
+                scimago_res = res
+                matched_issn = j.print_issn
+            elif res.status == "FAILED" and norm_e == "no data":
+                scimago_res = res
+
+        # 2. Try E-ISSN fallback if Print-ISSN failed or was missing
+        if (scimago_res is None or scimago_res.status == "FAILED") and norm_e != "no data":
+            res = scraper_inst.scrape_journal(norm_e)
+            if res.status in ["SUCCESS", "PARTIAL"]:
+                scimago_res = res
+                matched_issn = j.e_issn
+            elif scimago_res is None:
+                scimago_res = res
+
+        j_time = round(time.perf_counter() - j_start, 2)
+
+        if scimago_res and scimago_res.status in ["SUCCESS", "PARTIAL"]:
+            status_display = scimago_res.status
+            err_display = scimago_res.error or ""
+            j_id = scimago_res.journal_id
+            sjr_val = scimago_res.sjr
+            q_val = scimago_res.quartile
+            h_val = scimago_res.h_index
+            cov_val = scimago_res.coverage
+            scimago_url = scimago_res.journal_url
+            is_success = True
+        else:
+            status_display = "not found"
+            err_display = "Journal not found on SCImago"
+            j_id = "no data"
+            sjr_val = "no data"
+            q_val = "no data"
+            h_val = "no data"
+            cov_val = "no data"
+            scimago_url = "no data"
+            is_success = False
+
+        record = {
+            "Sl.No": j.sl_no,
+            "Full Journal Title": j.journal_title,
+            "Print-ISSN": j.print_issn,
+            "E-ISSN": j.e_issn,
+            "Publisher": j.publisher,
+            "Country": j.country,
+            "Scopus Indexing Status": s_res.scopus_status,
+            "Scopus Match Type": s_res.match_type,
+            "Scopus Source Record ID": s_res.sourcerecord_id,
+            "Scopus Source Title": s_res.source_title,
+            "Scopus Publisher": s_res.scopus_publisher,
+            "Scopus Coverage": s_res.scopus_coverage,
+            "SCImago Matched ISSN": matched_issn,
+            "SCImago Journal ID": j_id,
+            "SJR": sjr_val,
+            "Quartile": q_val,
+            "H-Index": h_val,
+            "SCImago Coverage": cov_val,
+            "SCImago URL": scimago_url,
+            "SCImago Status": status_display,
+            "SCImago Error": err_display,
+            "SCImago Execution Time (sec)": j_time,
+        }
+
+        return idx, record, is_success, j_time, j.journal_title, s_res.scopus_status, sjr_val, q_val, status_display
 
     with ScimagoScraper(headless=True, verbose=False) as scraper:
-        for idx, j in enumerate(journals, 1):
-            j_start = time.perf_counter()
-            scimago_attempted += 1
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            norm_print = normalize_issn(j.print_issn)
-            norm_e = normalize_issn(j.e_issn)
+        indexed_pairs = list(enumerate(eligible_pairs, 1))
+        scimago_attempted = len(eligible_pairs)
 
-            matched_issn = "no data"
-            scimago_res = None
+        processed_records = {}
 
-            # 1. Try Print-ISSN first
-            if norm_print != "no data":
-                res = scraper.scrape_journal(norm_print)
-                if res.status in ["SUCCESS", "PARTIAL"]:
-                    scimago_res = res
-                    matched_issn = j.print_issn
-                elif res.status == "FAILED" and norm_e == "no data":
-                    scimago_res = res
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(process_eligible_pair, item, scraper): item[0]
+                for item in indexed_pairs
+            }
+            for future in as_completed(future_map):
+                idx, record, is_success, j_time, title, sc_stat, sjr_val, q_val, status_display = future.result()
+                processed_records[idx] = record
+                if is_success:
+                    scimago_successful += 1
+                else:
+                    scimago_failed += 1
 
-            # 2. Try E-ISSN fallback if Print-ISSN failed or was missing
-            if (scimago_res is None or scimago_res.status == "FAILED") and norm_e != "no data":
-                res = scraper.scrape_journal(norm_e)
-                if res.status in ["SUCCESS", "PARTIAL"]:
-                    scimago_res = res
-                    matched_issn = j.e_issn
-                elif scimago_res is None:
-                    scimago_res = res
+                print(
+                    f"[ELIGIBLE {idx}/{len(eligible_pairs)}] {title[:30]:<30} | "
+                    f"Scopus: {sc_stat:<16} | SJR: {sjr_val:<6} | Q: {q_val:<2} ({j_time:.2f}s) [{status_display}]",
+                    flush=True
+                )
 
-            j_time = round(time.perf_counter() - j_start, 2)
-            journal_processing_times.append(j_time)
+        # Re-sort results by original CFR Sl.No order
+        for idx in range(1, len(eligible_pairs) + 1):
+            results.append(processed_records[idx])
 
-            if scimago_res and scimago_res.status in ["SUCCESS", "PARTIAL"]:
-                scimago_successful += 1
-                status_display = scimago_res.status
-                err_display = scimago_res.error or ""
-                j_id = scimago_res.journal_id
-                sjr_val = scimago_res.sjr
-                q_val = scimago_res.quartile
-                h_val = scimago_res.h_index
-                cov_val = scimago_res.coverage
-                scimago_url = scimago_res.journal_url
-            else:
-                scimago_failed += 1
-                status_display = "not found"
-                err_display = "Journal not found on SCImago"
-                j_id = "no data"
-                sjr_val = "no data"
-                q_val = "no data"
-                h_val = "no data"
-                cov_val = "no data"
-                scimago_url = "no data"
+    scimago_duration = round(time.perf_counter() - scimago_start_time, 2)
 
-            # Progress output
-            print(
-                f"[{idx}/{len(journals)}] {j.journal_title[:32]:<32} | "
-                f"P:{j.print_issn or 'none':<9} E:{j.e_issn or 'none':<9} -> "
-                f"Match: {matched_issn:<10} | Q: {q_val:<2} | SJR: {sjr_val:<6} | ({j_time:.2f}s) [{status_display}]",
-                flush=True
-            )
-
-            results.append({
-                "Sl.No": j.sl_no,
-                "Full Journal Title": j.journal_title,
-                "Print-ISSN": j.print_issn,
-                "E-ISSN": j.e_issn,
-                "Publisher": j.publisher,
-                "Country": j.country,
-                "SCImago Matched ISSN": matched_issn,
-                "SCImago Journal ID": j_id,
-                "SJR": sjr_val,
-                "Quartile": q_val,
-                "H-Index": h_val,
-                "Coverage": cov_val,
-                "SCImago URL": scimago_url,
-                "Status": status_display,
-                "Error": err_display,
-                "Processing Time (sec)": j_time,
-            })
+    # Append skipped non-eligible journals (Discontinued, Inactive, Not Indexed)
+    for j, s_res in skipped_pairs:
+        results.append({
+            "Sl.No": j.sl_no,
+            "Full Journal Title": j.journal_title,
+            "Print-ISSN": j.print_issn,
+            "E-ISSN": j.e_issn,
+            "Publisher": j.publisher,
+            "Country": j.country,
+            "Scopus Indexing Status": s_res.scopus_status,
+            "Scopus Match Type": s_res.match_type,
+            "Scopus Source Record ID": s_res.sourcerecord_id,
+            "Scopus Source Title": s_res.source_title,
+            "Scopus Publisher": s_res.scopus_publisher,
+            "Scopus Coverage": s_res.scopus_coverage,
+            "SCImago Matched ISSN": "skipped",
+            "SCImago Journal ID": "skipped",
+            "SJR": "skipped",
+            "Quartile": "skipped",
+            "H-Index": "skipped",
+            "SCImago Coverage": "skipped",
+            "SCImago URL": "skipped",
+            "SCImago Status": "skipped (not active in Scopus)",
+            "SCImago Error": "",
+            "SCImago Execution Time (sec)": 0.0,
+        })
 
     total_pipeline_time = round(time.perf_counter() - pipeline_start, 2)
-    avg_journal_time = round(sum(journal_processing_times) / len(journals), 2) if journals else 0.0
 
     # Write output to Excel
     out_df = pd.DataFrame(results)
-    out_path = os.path.join(OUTPUT_DIR, "cfr_scimago_results.xlsx")
+    out_path = os.path.join(OUTPUT_DIR, "cfr_scopus_scimago_results.xlsx")
     try:
         out_df.to_excel(out_path, index=False)
         saved_file = out_path
     except PermissionError:
-        alt_path = os.path.join(OUTPUT_DIR, "cfr_scimago_results_latest.xlsx")
+        alt_path = os.path.join(OUTPUT_DIR, "cfr_scopus_scimago_results_latest.xlsx")
         out_df.to_excel(alt_path, index=False)
         saved_file = alt_path
 
-    # Print Pipeline Summary
+    # Print Final Pipeline Execution Summary
     print("\n========================================")
-    print("PIPELINE SUMMARY")
+    print("COMPLETE PIPELINE EXECUTION SUMMARY")
     print("========================================")
-    print(f"CFR pages scraped:       {total_pages}")
-    print(f"CFR journals collected:  {len(journals)}")
+    print(f"Total CFR journals collected : {len(journals)}")
+    print(f"  Scopus Active / Indexed   : {scopus_stats['active_indexed']}")
+    print(f"  Scopus Inactive           : {scopus_stats['inactive']}")
+    print(f"  Scopus Discontinued       : {scopus_stats['discontinued']}")
+    print(f"  Scopus Not Indexed        : {scopus_stats['not_indexed']}")
+    print(f"  Scopus Unable to Verify   : {scopus_stats['unable_to_verify']}")
     print()
-    print(f"SCImago attempted:       {scimago_attempted}")
-    print(f"SCImago successful:      {scimago_successful}")
-    print(f"SCImago failed:          {scimago_failed}")
+    print(f"Sent to SCImago (Active)    : {len(eligible_pairs)}")
+    print(f"Skipped from SCImago        : {len(skipped_pairs)}")
+    print(f"  SCImago Successful        : {scimago_successful}")
+    print(f"  SCImago Failed            : {scimago_failed}")
     print()
-    print(f"CFR collection time:     {cfr_duration:.2f} sec")
-    print(f"Total execution time:    {total_pipeline_time:.2f} sec ({round(total_pipeline_time / 60.0, 2)} min)")
-    print(f"Average journal time:    {avg_journal_time:.2f} sec")
+    print("--- Execution Times ---")
+    print(f"CFR collection time         : {cfr_duration:.2f} sec")
+    print(f"Scopus initialization       : {scopus_init_time:.2f} sec")
+    print(f"Scopus verification         : {scopus_verify_time:.4f} sec")
+    print(f"SCImago stage time          : {scimago_duration:.2f} sec")
+    print(f"TOTAL PIPELINE TIME         : {total_pipeline_time:.2f} sec ({round(total_pipeline_time / 60.0, 2)} min)")
     print("========================================\n")
-    print(f"[SUCCESS] Results saved to {saved_file}")
+    print(f"[SUCCESS] Consolidated results saved to {saved_file}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CFR Journal Collection & SCImago Scraper")
+    parser = argparse.ArgumentParser(description="CFR Journal Collection, Scopus Verification & SCImago Scraper")
     parser.add_argument("--source-only", action="store_true", help="Scrape only CFR journals and export to Excel")
     parser.add_argument("--scimago-only", action="store_true", help="Run only SCImago POC on a given ISSN")
+    parser.add_argument("--scopus-file", type=str, default=None, help="Path to official Scopus Source Title List Excel")
     parser.add_argument("--issn", type=str, default=None, help="Single ISSN to scrape (used with --scimago-only)")
     parser.add_argument("--input", type=str, default=None, help="Path to input Excel file with an 'ISSN' column")
+    parser.add_argument("--workers", type=int, default=5, help="Number of concurrent workers for SCImago scraping (default: 5)")
 
     args = parser.parse_args()
 
@@ -366,8 +466,10 @@ def main():
     elif args.issn:
         run_single_issn(args.issn)
     else:
-        run_complete_pipeline()
+        scopus_path = args.scopus_file if args.scopus_file else os.path.join(OUTPUT_DIR, "scopus_source_title_list.xlsx")
+        run_complete_pipeline(scopus_file=scopus_path, workers=args.workers)
 
 
 if __name__ == "__main__":
     main()
+

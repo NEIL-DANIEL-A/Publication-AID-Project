@@ -16,6 +16,23 @@ class CFRJournal:
 
 
 @dataclass
+class ScopusVerificationResult:
+    scopus_status: str              # Active / Indexed, Inactive, Discontinued, Not Indexed, Unable to Verify
+    match_type: str                 # Print ISSN, E-ISSN, No Match
+    sourcerecord_id: str = "no data"
+    source_title: str = "no data"
+    scopus_issn: str = "no data"
+    scopus_eissn: str = "no data"
+    scopus_publisher: str = "no data"
+    scopus_coverage: str = "no data"
+    raw_active_status: str = "no data"
+    raw_discontinued_flag: str = "no data"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class JournalResult:
     issn: str
     journal_id: str

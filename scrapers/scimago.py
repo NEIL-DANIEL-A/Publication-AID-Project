@@ -3,7 +3,8 @@ import os
 import re
 import time
 import urllib.parse
-from typing import Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Tuple
 
 from scrapling.core.utils._utils import log as scrapling_log
 from scrapling.fetchers import Fetcher, StealthySession
@@ -469,3 +470,42 @@ class ScimagoScraper:
                 error=str(e),
                 execution_time=elapsed,
             )
+
+    def scrape_journals_batch(self, issns: list, max_workers: int = 5) -> List[JournalResult]:
+        """
+        Scrape a batch of ISSNs concurrently using ThreadPoolExecutor.
+        Maintains order of returned results corresponding to input issns list.
+        """
+        if not issns:
+            return []
+
+        results_map = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_issn = {
+                executor.submit(self.scrape_journal, issn): issn
+                for issn in issns
+            }
+            for future in as_completed(future_to_issn):
+                issn = future_to_issn[future]
+                try:
+                    res = future.result()
+                    results_map[issn] = res
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[ERROR] Batch worker failed for ISSN {issn}: {e}")
+                    results_map[issn] = JournalResult(
+                        issn=issn,
+                        journal_id="no data",
+                        sjr="no data",
+                        quartile="no data",
+                        h_index="no data",
+                        coverage="no data",
+                        search_url="no data",
+                        journal_url="no data",
+                        status="FAILED",
+                        error=str(e),
+                        execution_time=0.0,
+                    )
+
+        return [results_map.get(issn) for issn in issns]
+
