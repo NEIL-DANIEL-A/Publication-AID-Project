@@ -1,10 +1,14 @@
 import logging
 import os
+import re
 import sys
 import time
+import urllib.parse
+import urllib.request
 from typing import Dict, List, Tuple
 
 import pandas as pd
+from scrapling.parser import Adaptor
 
 from models import CFRJournal, ScopusVerificationResult
 from processors.issn import normalize_issn
@@ -32,10 +36,97 @@ REQUIRED_COLUMNS = [
     COL_PUBLISHER,
 ]
 
+ELSEVIER_SCOPUS_POLICY_URL = "https://www.elsevier.com/solutions/scopus/how-scopus-works/content/content-policy-and-selection"
+
+
+def download_scopus_dataset(dest_path: str) -> bool:
+    """
+    Dynamically discover and download the latest official Scopus Source Title List Excel
+    file directly from Elsevier's Content Policy page.
+    Always removes old existing copy to ensure the latest data is retrieved.
+    """
+    print(f"[INFO] Fetching latest Scopus Source Title List from Elsevier portal...")
+
+    if os.path.exists(dest_path):
+        try:
+            os.remove(dest_path)
+            print(f"[INFO] Deleted previous local dataset at '{dest_path}'.")
+        except Exception as e:
+            print(f"[WARNING] Could not delete existing dataset file: {e}")
+
+    try:
+        req = urllib.request.Request(
+            ELSEVIER_SCOPUS_POLICY_URL,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req) as resp:
+            html = resp.read().decode("utf-8")
+
+        doc = Adaptor(html)
+        download_url = None
+
+        for a in doc.css("a"):
+            href = a.attrib.get("href", "").strip()
+            href_lower = href.lower()
+            if ("ext_list" in href_lower or "source_title" in href_lower or "scopus_source" in href_lower) and (".xlsx" in href_lower or "ctfassets" in href_lower):
+                if href.startswith("//"):
+                    download_url = "https:" + href
+                elif href.startswith("http"):
+                    download_url = href
+                else:
+                    download_url = urllib.parse.urljoin(ELSEVIER_SCOPUS_POLICY_URL, href)
+                break
+
+        if not download_url:
+            matches = re.findall(r'href=["\']([^"\']*ctfassets[^"\']*ext_list[^"\']*\.xlsx?)["\']', html, re.IGNORECASE)
+            if matches:
+                download_url = matches[0]
+                if download_url.startswith("//"):
+                    download_url = "https:" + download_url
+
+        if not download_url:
+            print("[ERROR] Could not automatically locate Scopus download URL on Elsevier page.")
+            return False
+
+        print(f"[INFO] Downloading fresh Scopus Source Title List from:\n       {download_url}")
+        os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+
+        req_dl = urllib.request.Request(
+            download_url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req_dl) as resp_dl, open(dest_path, "wb") as f_out:
+            f_out.write(resp_dl.read())
+
+        file_size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+        print(f"[SUCCESS] Fresh Scopus Source Title List downloaded successfully ({file_size_mb:.2f} MB).")
+        return True
+
+    except Exception as e:
+        print(f"[ERROR] Failed to dynamically download Scopus dataset: {e}")
+        return False
+
+
+def ensure_scopus_dataset(excel_path: str, force_redownload: bool = True):
+    """
+    Ensure the Scopus Source Title List dataset is updated.
+    If force_redownload is True (default), always deletes local copy and downloads fresh version.
+    """
+    if force_redownload or not os.path.exists(excel_path):
+        success = download_scopus_dataset(excel_path)
+        if not success or not os.path.exists(excel_path):
+            if os.path.exists(excel_path):
+                print("[WARNING] Download failed, falling back to existing cached dataset.")
+            else:
+                raise FileNotFoundError(
+                    f"[ERROR] Could not obtain Scopus Source Title List at '{excel_path}'."
+                )
+
 
 class ScopusVerifier:
-    def __init__(self, excel_path: str):
+    def __init__(self, excel_path: str, force_redownload: bool = True):
         self.excel_path = excel_path
+        ensure_scopus_dataset(self.excel_path, force_redownload=force_redownload)
         self.issn_map: Dict[str, dict] = {}
         self.load_time: float = 0.0
         self.construction_time: float = 0.0
@@ -47,7 +138,6 @@ class ScopusVerifier:
         if not os.path.exists(self.excel_path):
             raise FileNotFoundError(f"[ERROR] Scopus Source Title List file not found: {self.excel_path}")
 
-        # Find the primary Scopus Sources sheet
         target_sheet = None
         for sheet in xl.sheet_names:
             if sheet.startswith("Scopus Sources"):
@@ -75,7 +165,6 @@ class ScopusVerifier:
         t1 = time.perf_counter()
         self.load_time = t1 - t0
 
-        # Validate required column headers
         missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
         if missing_cols:
             raise KeyError(
@@ -83,7 +172,6 @@ class ScopusVerifier:
                 f"Available columns: {list(df.columns)}"
             )
 
-        # Build ISSN lookup map with duplicate tracking
         t_const_start = time.perf_counter()
         seen_p_issns: Dict[str, dict] = {}
         seen_e_issns: Dict[str, dict] = {}
@@ -98,7 +186,6 @@ class ScopusVerifier:
             raw_active = str(row[COL_ACTIVE_STATUS]).strip() if pd.notna(row[COL_ACTIVE_STATUS]) else ""
             raw_disc = str(row[COL_DISCONTINUED]).strip() if pd.notna(row[COL_DISCONTINUED]) else ""
 
-            # Classify Scopus Indexing Status
             if raw_disc == "Discontinued by Scopus":
                 scopus_status = "Discontinued"
             elif raw_active == "Active":
@@ -122,26 +209,14 @@ class ScopusVerifier:
                 "scopus_status": scopus_status,
             }
 
-            # Safe duplicate handling & mapping
             if norm_p != "no data":
-                if norm_p in seen_p_issns:
-                    logger.warning(
-                        f"[WARNING] Duplicate Print-ISSN '{norm_p}' in Scopus dataset! "
-                        f"Existing: {seen_p_issns[norm_p]['source_title']} vs New: {record['source_title']}"
-                    )
-                else:
+                if norm_p not in seen_p_issns:
                     seen_p_issns[norm_p] = record
                 self.issn_map[norm_p] = record
 
             if norm_e != "no data":
-                if norm_e in seen_e_issns:
-                    logger.warning(
-                        f"[WARNING] Duplicate E-ISSN '{norm_e}' in Scopus dataset! "
-                        f"Existing: {seen_e_issns[norm_e]['source_title']} vs New: {record['source_title']}"
-                    )
-                else:
+                if norm_e not in seen_e_issns:
                     seen_e_issns[norm_e] = record
-                # Note: If Print-ISSN already mapped this key, Print-ISSN takes precedence in key index
                 if norm_e not in self.issn_map:
                     self.issn_map[norm_e] = record
 
@@ -156,12 +231,10 @@ class ScopusVerifier:
         match_record = None
         match_type = "No Match"
 
-        # 1. Try Print-ISSN first
         if norm_p != "no data" and norm_p in self.issn_map:
             match_record = self.issn_map[norm_p]
             match_type = "Print ISSN"
 
-        # 2. Try E-ISSN fallback if no match
         elif norm_e != "no data" and norm_e in self.issn_map:
             match_record = self.issn_map[norm_e]
             match_type = "E-ISSN"
@@ -180,7 +253,6 @@ class ScopusVerifier:
                 raw_discontinued_flag=match_record["raw_discontinued_flag"],
             )
 
-        # No match found
         return ScopusVerificationResult(
             scopus_status="Not Indexed",
             match_type="No Match",
@@ -188,16 +260,12 @@ class ScopusVerifier:
 
 
 def verify_scopus_indexing(
-    journals: List[CFRJournal], source_file: str
+    journals: List[CFRJournal], source_file: str, force_redownload: bool = True
 ) -> Tuple[List[Tuple[CFRJournal, ScopusVerificationResult]], dict]:
     """
     Exposed functional API to verify a list of CFRJournal records against Scopus Source Title List.
-
-    Returns:
-        - List of (CFRJournal, ScopusVerificationResult) tuples
-        - Timing & statistics dict
     """
-    verifier = ScopusVerifier(source_file)
+    verifier = ScopusVerifier(source_file, force_redownload=force_redownload)
 
     t_verify_start = time.perf_counter()
     verified_results = []

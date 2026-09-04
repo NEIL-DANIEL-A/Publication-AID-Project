@@ -1,6 +1,6 @@
-# CFR Data Collection & SCImago Scraper Pipeline
+# CFR Data Collection & Publication AID Project
 
-A modular Python pipeline that collects academic journal lists from the CFR Anna University portal, normalizes Print and Electronic ISSNs, queries SCImago for key scientometric indicators (SJR, Quartile, H-Index, Coverage), and exports enriched datasets to Excel.
+An automated, end-to-end data pipeline to collect academic journal listings from the CFR Anna University portal, verify their current Scopus indexing status against the official Scopus Source Title List dataset, scrape SCImago metrics (SJR, Quartile, H-Index, Coverage), and consolidate everything into a structured Excel report.
 
 ---
 
