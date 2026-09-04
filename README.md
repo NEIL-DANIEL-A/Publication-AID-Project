@@ -1,147 +1,208 @@
-# SCImago Journal Scraper POC (Scrapling)
+# CFR Data Collection & SCImago Scraper Pipeline
 
-A lightweight Proof of Concept (POC) Python project to scrape SCImago journal metrics (**Journal ID**, **SJR**, **Quartile**, **H-Index**, **Coverage**, and **Execution Time**) given an ISSN, built with [Scrapling](https://github.com/D4Vinci/Scrapling).
-
----
-
-## Requirements & Python Version
-
-- **Python**: 3.11+ (Tested on Python 3.14)
-- **Dependencies**: `scrapling[all]`, `pandas`, `openpyxl`
-- **Browser Automation**: Patchright / Chromium browser binaries managed via Scrapling.
+A modular Python pipeline that collects academic journal lists from the CFR Anna University portal, normalizes Print and Electronic ISSNs, queries SCImago for key scientometric indicators (SJR, Quartile, H-Index, Coverage), and exports enriched datasets to Excel.
 
 ---
 
-## Installation
+## 1. Project Purpose
 
-1. **Navigate to the Project Directory**:
-   ```bash
-   cd POC-Scimago
-   ```
-
-2. **Create and Activate Virtual Environment**:
-   ```bash
-   # Windows (PowerShell)
-   python -m venv .venv
-   .\.venv\Scripts\activate
-
-   # Linux / macOS
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-3. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Install Browser Binaries**:
-   ```bash
-   scrapling install
-   # or
-   patchright install chromium
-   ```
+The purpose of this project is to automate the discovery and enrichment of recognized academic journals:
+1. **CFR Data Collection**: Scrapes journal records published on the CFR portal ([CFR English Journals List](https://cfr.annauniv.edu/research/academics/english-journals-list.php)).
+2. **ISSN Normalization**: Strips formatting and non-numeric characters from Print-ISSN and E-ISSN.
+3. **SCImago Scientometrics Lookup**: Queries SCImago using Print-ISSN first, with automatic fallback to E-ISSN.
+4. **Combined Reporting**: Exports structured Excel workbooks with per-journal processing times and overall pipeline metrics.
 
 ---
 
-## Usage
+## 2. Architecture & Directory Structure
 
-### 1. Single ISSN Mode (Default POC)
+```text
+POC-Scimago/
+│
+├── main.py                     # Central CLI & pipeline orchestrator
+├── models.py                   # Dataclasses: CFRJournal, JournalResult
+│
+├── scrapers/
+│   ├── __init__.py             # Exposes scrape_cfr_journals, ScimagoScraper
+│   ├── cfr_data_collection.py  # CFR portal scraping & pagination handler
+│   └── scimago.py              # SCImago scraper (fast HTTP Fetcher + stealth browser)
+│
+├── processors/
+│   ├── __init__.py             # Exposes normalize_issn
+│   └── issn.py                 # ISSN normalization and sanitization logic
+│
+├── output/
+│   ├── cfr_journals.xlsx       # Output of source-only mode
+│   ├── cfr_scimago_results.xlsx# Output of complete pipeline
+│   ├── scimago_results.xlsx    # Output of batch mode (--input)
+│   ├── result.json             # Output of single ISSN mode
+│   └── debug/                  # Diagnostic HTML dumps saved on errors
+│
+├── requirements.txt            # Project dependencies
+└── README.md                   # Documentation
+```
 
-Run default test with ISSN `01296612`:
-```bash
+### Module Separation of Concerns
+- `scrapers/cfr_data_collection.py` knows **nothing** about SCImago. It only scrapes the CFR table and returns `CFRJournal` records.
+- `scrapers/scimago.py` knows **nothing** about CFR. It only resolves an individual ISSN against SCImago.
+- `processors/issn.py` handles ISSN string cleanup and validation.
+- `main.py` orchestrates the stages, handles fallback logic, tracks execution times, and exports Excel reports.
+
+---
+
+## 3. Installation
+
+Ensure Python 3.10+ is installed on Windows:
+
+```powershell
+# 1. Activate virtual environment
+.\.venv\Scripts\activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Install browser engine for Scrapling stealth mode (one-time)
+scrapling install
+```
+
+---
+
+## 4. How to Run
+
+### Mode A: Source-Only Mode (CFR Collection Only)
+
+Scrapes all CFR journal list pages and exports only the raw CFR fields to `output/cfr_journals.xlsx`:
+
+```powershell
+python main.py --source-only
+```
+
+**Output Columns**:
+`Sl.No`, `Full Journal Title`, `Print-ISSN`, `E-ISSN`, `Publisher`, `Country`
+
+---
+
+### Mode B: Complete Pipeline (CFR + SCImago Enrichment)
+
+Scrapes CFR records, normalizes ISSNs, checks SCImago (Print-ISSN then E-ISSN fallback), and outputs `output/cfr_scimago_results.xlsx`:
+
+```powershell
 python main.py
 ```
 
-Or pass any custom ISSN:
-```bash
-python main.py --issn 0129-6612
-python main.py --issn 00000000
+**Output Columns**:
+1. `Sl.No`
+2. `Full Journal Title`
+3. `Print-ISSN`
+4. `E-ISSN`
+5. `Publisher`
+6. `Country`
+7. `SCImago Matched ISSN`
+8. `SCImago Journal ID`
+9. `SJR`
+10. `Quartile`
+11. `H-Index`
+12. `Coverage`
+13. `SCImago URL`
+14. `Status`
+15. `Error`
+16. `Processing Time (sec)`
+
+---
+
+### Mode C: SCImago-Only Mode (Single ISSN Test)
+
+Tests the SCImago lookup on a single ISSN without touching the CFR website:
+
+```powershell
+python main.py --scimago-only --issn 01296612
 ```
 
-Results are printed to the console and saved to `output/result.json`.
+---
 
-### 2. Batch Excel Mode
+### Mode D: Batch Excel Mode (Existing Test Feature)
 
-Process an Excel sheet containing an `ISSN` column:
-```bash
+Processes an arbitrary Excel file containing an `ISSN` column:
+
+```powershell
 python main.py --input test_input.xlsx
 ```
 
-Results are saved to `output/scimago_results.xlsx` (or `output/scimago_results_latest.xlsx` if locked) with columns:
-- `ISSN`
-- `Journal ID`
-- `SJR`
-- `Quartile`
-- `H-Index`
-- `Coverage`
-- `Status`
-- `Error`
-- `Execution Time (seconds)`
+---
+
+## 5. CFR Pagination Handling
+
+The CFR scraper (`scrapers/cfr_data_collection.py`):
+- Connects to the starting URL dynamically.
+- Automatically inspects the DOM for next-page links (`rel="next"`, anchors with `next`, `>`, `»`, pagination classes).
+- Maintains a `visited_urls` set to prevent duplicate page visits or infinite pagination loops.
+- Does **not** hardcode page numbers.
 
 ---
 
-## Expected Output
+## 6. ISSN Normalization
 
-### Single-ISSN Output Example
+Defined in `processors/issn.py`:
+- Strips hyphens, spaces, and punctuation (`r"[^0-9Xx]"`).
+- Normalizes check characters to uppercase (e.g., `X`).
+- Returns `"no data"` if the input is empty or contains placeholders (`"-"`, `"none"`, `"nan"`, `"null"`).
+- The original CFR values (`Print-ISSN` and `E-ISSN`) are preserved verbatim in the output; normalized values are used strictly for SCImago querying.
+
+---
+
+## 7. Print-ISSN → E-ISSN Fallback Logic
+
+For every journal in the CFR collection:
+1. `Print-ISSN` is normalized and queried against SCImago.
+2. If SCImago returns `SUCCESS` or `PARTIAL`, that result is kept, and `SCImago Matched ISSN` is recorded as the Print-ISSN.
+3. If Print-ISSN yields no match (`FAILED`) or is empty, the pipeline queries `E-ISSN`.
+4. If E-ISSN succeeds, `SCImago Matched ISSN` is recorded as the E-ISSN.
+5. If both fail, `Status` is marked as `"not found"`, and SCImago metrics are set to `"no data"`.
+
+---
+
+## 8. SCImago Extraction
+
+The SCImago scraper extracts 4 scientometric metrics using CSS selectors and regex patterns:
+- **SJR**: `.hsjr` or `.hindexnumber.hindex-white`
+- **Quartile**: `.hindexnumber.hindex-white span` or `span.Q1/Q2/Q3/Q4`
+- **H-Index**: `div.cuadrado` container possessing an `<h2>H-Index</h2>` header → `.hindexnumber`
+- **Coverage**: `div.cuadrado` container possessing an `<h2>Coverage</h2>` header → `.cuadrado-detail`
+
+---
+
+## 9. Timing & Performance Measurements
+
+The pipeline uses `time.perf_counter()` to provide granular measurements:
+- **CFR Collection Duration**: Wall-clock time to fetch and parse all CFR pages.
+- **Per-Journal Processing Time**: Time taken to normalize, query Print-ISSN, query E-ISSN fallback (if applicable), and parse the SCImago response.
+- **Total Pipeline Time**: Wall-clock time from start to final Excel generation.
+
+### Pipeline Summary Output Example
+
 ```text
 ========================================
-SCIMAGO POC
+PIPELINE SUMMARY
 ========================================
-ISSN       : 01296612
-Journal ID : 23067
-SJR        : 0.328
-Quartile   : Q2
-H-Index    : 17
-Coverage   : 1974-2026
-Status     : SUCCESS
+CFR pages scraped:       1
+CFR journals collected:  257
 
-----------------------------------------
-ISSN Execution Time : 1.53 seconds
-----------------------------------------
-Search URL : https://www.scimagojr.com/journalsearch.php?q=01296612
-Journal URL: https://www.scimagojr.com/journalsearch.php?q=23067&tip=sid&clean=0
+SCImago attempted:       257
+SCImago successful:      257
+SCImago failed:          0
+
+CFR collection time:     0.30 sec
+Total execution time:    351.78 sec (5.86 min)
+Average journal time:    1.37 sec
 ========================================
-```
 
-### Batch Summary Output Example
-```text
-========================================
-SCIMAGO BATCH SUMMARY
-========================================
-Total ISSNs     : 12
-Successful      : 12
-Partial         : 0
-Failed          : 0
-
-Total Batch Time: 18.53 seconds (0.31 minutes)
-
-Average / ISSN  : 1.54 seconds
-
-Estimates based on measured average:
-  100 ISSNs  ≈ 2.6 minutes
-  500 ISSNs  ≈ 12.9 minutes
-  1000 ISSNs ≈ 25.7 minutes
-========================================
+[SUCCESS] Results saved to C:\Users\neil-\Projects\POC-Scimago\output\cfr_scimago_results.xlsx
 ```
 
 ---
 
-## Metric Extraction Details
+## 10. Known Limitations & Notes
 
-1. **ISSN Normalization**: Strips hyphens, whitespace, and formatting (e.g. `0129-6612` $\rightarrow$ `01296612`).
-2. **Journal ID**: Extracted by parsing query parameter `q` from target hrefs matching `journalsearch.php?q=...&tip=sid`.
-3. **SJR**: Extracted using `.hsjr` tag (with fallback to `.hindexnumber.hindex-white`).
-4. **Quartile**: Extracted dynamically using regex `r'\b(Q[1-4])\b'` across `.hindexnumber.hindex-white` card and span classes.
-5. **H-Index**: Label-based extraction matching `<h2>H-Index</h2>` parent container `<div class="cuadrado">` and reading `.hindexnumber`.
-6. **Coverage**: Label-based extraction matching `<h2>Coverage</h2>` parent container `<div class="cuadrado">` and reading `.cuadrado-detail` text (e.g., `1974-2026`).
-7. **Per-ISSN Execution Time**: Measured using `time.perf_counter()` from normalization to result assembly.
-8. **Batch Execution Time**: Wall-clock duration measured independently from start to final file export using `time.perf_counter()`.
-
----
-
-## Error Handling & Debugging
-
-- **Missing / Invalid Records**: If an ISSN has no journal entries (e.g., `00000000`), the scraper returns `"no data"` for missing fields and `status="FAILED"`.
-- **Diagnostic HTML Dumps**: Saved to `output/debug/` when an extraction fails or returns missing metrics.
-- **Security / Challenge Pages**: Automatically handles Cloudflare challenges via `solve_cloudflare=True` fallback.
+1. **Sequential Execution**: Processing 257 journals takes ~5.8 minutes at ~1.37s/journal. Concurrency is not yet introduced to avoid aggressive rate-limiting by SCImago.
+2. **CFR SSL Certificate**: The CFR Anna University server does not supply an intermediate certificate chain recognized by default Windows OpenSSL trust stores. Requests to CFR are fetched with `verify=False`.
+3. **File Lock Fallback**: If `cfr_scimago_results.xlsx` or `cfr_journals.xlsx` is currently open in Microsoft Excel when writing, the script automatically writes to `*_latest.xlsx` to avoid a crash.

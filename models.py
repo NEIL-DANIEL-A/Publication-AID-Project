@@ -3,6 +3,19 @@ from typing import Optional
 
 
 @dataclass
+class CFRJournal:
+    sl_no: str
+    journal_title: str
+    print_issn: str
+    e_issn: str
+    publisher: str
+    country: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class JournalResult:
     issn: str
     journal_id: str
