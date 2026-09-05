@@ -13,6 +13,27 @@ from processors.issn import normalize_issn
 from scrapers.cfr_data_collection import scrape_cfr_journals
 from scrapers.scimago import ScimagoScraper
 
+# Database (Supabase) - optional, graceful fallback to Excel if not configured
+try:
+    from database.connection import get_supabase_client, is_supabase_configured
+    from database.hash import build_hash_input, compute_data_hash, _normalize_value
+    from database.repository import (
+        get_journal_by_issn,
+        get_all_journals_map,
+        get_existing_full,
+        insert_journal_full,
+        update_journal_full,
+        touch_journal_checked,
+        create_pipeline_run,
+        finish_pipeline_run,
+        insert_skipped_record,
+    )
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+    is_supabase_configured = lambda: False  # type: ignore
+    _normalize_value = lambda v: str(v or "").strip().lower()  # type: ignore
+
 DEFAULT_ISSN = "01296612"
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 
@@ -212,7 +233,8 @@ def run_source_only():
 def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     """
     Complete pipeline:
-    CFR collection -> Scopus Verification -> Filter (Active / Indexed) -> SCImago lookup -> Consolidated Excel.
+    CFR collection -> Scopus Verification -> MJL Verification (hybrid) -> SCImago lookup -> Consolidated Excel.
+    Filtering: Only Scopus Active / Indexed journals proceed to MJL and SCImago.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     pipeline_start = time.perf_counter()
@@ -228,6 +250,42 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"[TIME] CFR collection duration: {cfr_duration:.2f} seconds\n")
 
     report_duplicates(journals)
+    # Deduplicate CFR by ISSN (both Print and E-ISSN) - same ISSN appearing as Print in one row and E-ISSN in another (e.g., 2572-3618 at sl_no 124 and 151) would cause 2 DB updates per run
+    # Skipped details are stored in skipped_records table for audit (so you know which one is skipped)
+    seen_issns = {}
+    deduped = []
+    dup_skipped = 0
+    cfr_skipped_details = []  # list of dicts for DB insert later
+    for j in journals:
+        norms = [n for n in (normalize_issn(j.print_issn), normalize_issn(j.e_issn)) if n != "no data"]
+        duplicate_norm = next((n for n in norms if n in seen_issns), None)
+        if duplicate_norm:
+            dup_skipped += 1
+            kept_title = seen_issns[duplicate_norm]
+            print(f"[SKIPPED] CFR duplicate ISSN {duplicate_norm} -> sl_no {j.sl_no} '{j.journal_title[:40]}' (kept '{kept_title[:40]}')")
+            cfr_skipped_details.append({
+                "sl_no": j.sl_no,
+                "journal_title": j.journal_title,
+                "print_issn": j.print_issn,
+                "e_issn": j.e_issn,
+                "normalized_print": normalize_issn(j.print_issn),
+                "normalized_e": normalize_issn(j.e_issn),
+                "publisher": j.publisher,
+                "country": j.country,
+                "reason": "duplicate_issn",
+                "duplicate_of_issn": duplicate_norm,
+                "duplicate_of_title": kept_title,
+            })
+            continue
+        for n in norms:
+            seen_issns[n] = j.journal_title
+        deduped.append(j)
+    if dup_skipped:
+        print(f"[INFO] CFR deduplicated: {len(journals)} -> {len(deduped)} (skipped {dup_skipped} duplicate ISSN)")
+        journals = deduped
+    # Keep skipped details for DB insert after pipeline_run_id is created
+    # (attached to function attribute for later use)
+    run_complete_pipeline._cfr_skipped_details = cfr_skipped_details
     print()
 
     # Stage 2: Scopus Verification
@@ -254,11 +312,33 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"  Scopus Unable to Verify : {scopus_stats['unable_to_verify']}")
     print("-----------------------------------\n")
 
-    # Stage 3: Filtering & SCImago Enrichment
+    # Stage 3: MJL Index Verification (Clarivate Web of Science) - Hybrid
     eligible_pairs = [(j, s) for j, s in verified_pairs if s.scopus_status == "Active / Indexed"]
-    skipped_pairs = [(j, s) for j, s in verified_pairs if s.scopus_status != "Active / Indexed"]
+    skipped_pairs  = [(j, s) for j, s in verified_pairs if s.scopus_status != "Active / Indexed"]
 
-    print(f"[INFO] Stage 3: SCImago Enrichment (Eligible Active/Indexed: {len(eligible_pairs)} | Skipped: {len(skipped_pairs)})...")
+    print(f"[INFO] Stage 3: MJL Index Verification (Active/Indexed: {len(eligible_pairs)} journals)...")
+    mjl_start_time = time.perf_counter()
+
+    from scrapers.mjl import verify_mjl_indexing
+    mjl_triples = verify_mjl_indexing(eligible_pairs, headless=True, verbose=False, max_workers=workers)
+
+    mjl_duration = round(time.perf_counter() - mjl_start_time, 2)
+
+    mjl_found      = sum(1 for _, _, m in mjl_triples if m.mjl_status == "Found")
+    mjl_not_found  = sum(1 for _, _, m in mjl_triples if m.mjl_status == "Not Found")
+    mjl_unverified = sum(1 for _, _, m in mjl_triples if m.mjl_status == "Unable to Verify")
+
+    print(f"\n--- MJL Verification Summary ---")
+    print(f"  MJL Found           : {mjl_found}")
+    print(f"  MJL Not Found       : {mjl_not_found}")
+    print(f"  MJL Unable to Verify: {mjl_unverified}")
+    print(f"  MJL Stage Time      : {mjl_duration:.2f} sec")
+    print(f"--------------------------------\n")
+
+    mjl_lookup = {j.sl_no: m for j, _, m in mjl_triples}
+
+    # Stage 4: SCImago Enrichment (same eligible set)
+    print(f"[INFO] Stage 4: SCImago Enrichment (Eligible Active/Indexed: {len(eligible_pairs)} | Skipped: {len(skipped_pairs)})...")
 
     results = []
     scimago_attempted = 0
@@ -319,6 +399,12 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             scimago_url = "no data"
             is_success = False
 
+        m_res = mjl_lookup.get(j.sl_no)
+        mjl_status_val  = m_res.mjl_status       if m_res else "no data"
+        mjl_index_val   = m_res.mjl_index        if m_res else "no data"
+        mjl_issn_val    = m_res.mjl_issn_used    if m_res else "no data"
+        mjl_title_val   = m_res.mjl_source_title if m_res else "no data"
+
         record = {
             "Sl.No": j.sl_no,
             "Full Journal Title": j.journal_title,
@@ -332,6 +418,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             "Scopus Source Title": s_res.source_title,
             "Scopus Publisher": s_res.scopus_publisher,
             "Scopus Coverage": s_res.scopus_coverage,
+            "MJL Status": mjl_status_val,
+            "MJL Index": mjl_index_val,
+            "MJL Matched ISSN": mjl_issn_val,
+            "MJL Source Title": mjl_title_val,
             "SCImago Matched ISSN": matched_issn,
             "SCImago Journal ID": j_id,
             "SJR": sjr_val,
@@ -394,6 +484,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             "Scopus Source Title": s_res.source_title,
             "Scopus Publisher": s_res.scopus_publisher,
             "Scopus Coverage": s_res.scopus_coverage,
+            "MJL Status": "skipped",
+            "MJL Index": "skipped",
+            "MJL Matched ISSN": "skipped",
+            "MJL Source Title": "skipped",
             "SCImago Matched ISSN": "skipped",
             "SCImago Journal ID": "skipped",
             "SJR": "skipped",
@@ -406,16 +500,253 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             "SCImago Execution Time (sec)": 0.0,
         })
 
+    # ------------------------------------------------------------------ #
+    # Database incremental persistence (Supabase - source of truth)
+    # ------------------------------------------------------------------ #
+    use_db = DB_AVAILABLE and is_supabase_configured()
+    db_stats = {"new_records": 0, "updated_records": 0, "unchanged_records": 0, "failed_records": 0}
+    pipeline_run_id = None
+    db_duration = 0.0
+
+    if use_db:
+        try:
+            pipeline_run_id = create_pipeline_run(total_cfr=len(journals))
+        except Exception as e:
+            print(f"[WARNING] Could not create pipeline_run: {e}")
+            pipeline_run_id = None
+
+        # Persist skipped CFR duplicates (so you know which one is skipped)
+        if pipeline_run_id and hasattr(run_complete_pipeline, '_cfr_skipped_details'):
+            skipped_list = getattr(run_complete_pipeline, '_cfr_skipped_details', [])
+            if skipped_list:
+                print(f"[INFO] DB: Persisting {len(skipped_list)} skipped CFR duplicate(s) to skipped_records...", flush=True)
+                for s in skipped_list:
+                    try:
+                        insert_skipped_record(
+                            pipeline_run_id,
+                            s["journal_title"], s["print_issn"], s["e_issn"],
+                            s["normalized_print"], s["normalized_e"],
+                            s["publisher"], s["country"], s["sl_no"],
+                            s["reason"], s["duplicate_of_issn"], s["duplicate_of_title"]
+                        )
+                        print(f"  [SKIPPED-DB] sl_no {s['sl_no']} '{s['journal_title'][:35]}' ISSN {s['duplicate_of_issn']} (kept '{s['duplicate_of_title'][:30]}')", flush=True)
+                    except Exception as e:
+                        print(f"[WARNING] Could not insert skipped record {s['sl_no']}: {e}")
+            # Track for pipeline summary
+            db_stats["duplicate_skipped"] = len(skipped_list)
+        else:
+            db_stats["duplicate_skipped"] = 0
+
+        # Bulk fetch for fast lookup (1 query vs 500+)
+        print(f"[INFO] DB: Fetching existing journals for incremental check...", flush=True)
+        bulk_start = time.perf_counter()
+        try:
+            from processors.issn import normalize_issn as _norm
+            journals_map = get_all_journals_map()
+            unique_journals = len(set(v["id"] for v in journals_map.values())) if journals_map else 0
+            print(f"[INFO] DB: Loaded {unique_journals} existing journals ({len(journals_map)} ISSN keys) in {time.perf_counter()-bulk_start:.2f}s (bulk, 1 query)", flush=True)
+            # Build lookup helper
+            def _lookup_existing(print_raw, e_raw):
+                for norm in (_norm(print_raw), _norm(e_raw)):
+                    if norm == "no data" or not norm:
+                        continue
+                    if norm in journals_map:
+                        return journals_map[norm]
+                return None
+        except Exception as e:
+            print(f"[WARNING] Bulk fetch failed, falling back to per-journal lookup: {e}")
+            journals_map = {}
+            def _lookup_existing(print_raw, e_raw):
+                return get_journal_by_issn(print_raw, e_raw)
+
+        db_start = time.perf_counter()
+        total = len(results)
+        for idx, rec in enumerate(results, 1):
+            # Progress log every record (fast) + summary every 50
+            if idx == 1 or idx % 50 == 0 or idx == total:
+                print(f"[DB {idx}/{total}] Processing {rec.get('Full Journal Title','?')[:35]:35} ...", flush=True)
+            try:
+                # Build hash input from all sources
+                hash_input = build_hash_input(
+                    journal_title=rec["Full Journal Title"],
+                    print_issn=rec["Print-ISSN"],
+                    e_issn=rec["E-ISSN"],
+                    publisher=rec["Publisher"],
+                    country=rec["Country"],
+                    scopus_status=rec["Scopus Indexing Status"],
+                    scopus_match_type=rec["Scopus Match Type"],
+                    scopus_source_title=rec["Scopus Source Title"],
+                    scopus_sourcerecord_id=rec["Scopus Source Record ID"],
+                    scopus_publisher=rec["Scopus Publisher"],
+                    scopus_coverage=rec["Scopus Coverage"],
+                    scopus_issn="",  # stored in scopus_results but not in record
+                    scopus_eissn="",
+                    mjl_status=rec["MJL Status"],
+                    mjl_index=rec["MJL Index"],
+                    mjl_issn_used=rec["MJL Matched ISSN"],
+                    mjl_source_title=rec["MJL Source Title"],
+                    scimago_status=rec["SCImago Status"],
+                    scimago_journal_id=rec["SCImago Journal ID"],
+                    scimago_matched_issn=rec["SCImago Matched ISSN"],
+                    sjr=rec["SJR"],
+                    quartile=rec["Quartile"],
+                    h_index=rec["H-Index"],
+                    scimago_coverage=rec["SCImago Coverage"],
+                    scimago_url=rec["SCImago URL"],
+                )
+                new_hash = compute_data_hash(hash_input)
+
+                # Prepare DB payloads
+                journal_data = {
+                    "title": rec["Full Journal Title"],
+                    "print_issn": rec["Print-ISSN"],
+                    "e_issn": rec["E-ISSN"],
+                    "publisher": rec["Publisher"],
+                    "country": rec["Country"],
+                }
+                cfr_data = {
+                    "sl_no": rec["Sl.No"],
+                    "journal_title": rec["Full Journal Title"],
+                    "print_issn": rec["Print-ISSN"],
+                    "e_issn": rec["E-ISSN"],
+                    "publisher": rec["Publisher"],
+                    "country": rec["Country"],
+                }
+                scopus_data = {
+                    "scopus_status": rec["Scopus Indexing Status"],
+                    "match_type": rec["Scopus Match Type"],
+                    "sourcerecord_id": rec["Scopus Source Record ID"],
+                    "source_title": rec["Scopus Source Title"],
+                    "scopus_publisher": rec["Scopus Publisher"],
+                    "scopus_coverage": rec["Scopus Coverage"],
+                    "scopus_issn": "",
+                    "scopus_eissn": "",
+                    "raw_active_status": "",
+                    "raw_discontinued_flag": "",
+                }
+                # For skipped, execution_time is skipped string; handle
+                mjl_exec = rec.get("MJL Execution Time (sec)", "no data")
+                try:
+                    mjl_exec_val = float(mjl_exec) if str(mjl_exec).replace(".", "", 1).isdigit() else None
+                except:
+                    mjl_exec_val = None
+                mjl_data = {
+                    "mjl_status": rec["MJL Status"],
+                    "mjl_index": rec["MJL Index"],
+                    "mjl_issn_used": rec["MJL Matched ISSN"],
+                    "mjl_match_type": "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped") else "Print ISSN",
+                    "mjl_source_title": rec["MJL Source Title"],
+                    "execution_time": mjl_exec_val,
+                    "error": "",
+                }
+                sci_exec = rec.get("SCImago Execution Time (sec)", 0.0)
+                try:
+                    sci_exec_val = float(sci_exec)
+                except:
+                    sci_exec_val = 0.0
+                scimago_data = {
+                    "scimago_status": rec["SCImago Status"],
+                    "journal_id_external": rec["SCImago Journal ID"],
+                    "matched_issn": rec["SCImago Matched ISSN"],
+                    "sjr": rec["SJR"],
+                    "quartile": rec["Quartile"],
+                    "h_index": rec["H-Index"],
+                    "coverage": rec["SCImago Coverage"],
+                    "url": rec["SCImago URL"],
+                    "execution_time": sci_exec_val,
+                    "error": rec["SCImago Error"],
+                }
+
+                existing = _lookup_existing(rec["Print-ISSN"], rec["E-ISSN"])
+                if existing is None:
+                    # Case A: New
+                    new_id = insert_journal_full(journal_data, cfr_data, scopus_data, mjl_data, scimago_data, new_hash, pipeline_run_id or "")
+                    # Add to map for duplicate ISSN within same run
+                    from processors.issn import normalize_issn as _n2
+                    for norm in (_n2(rec["Print-ISSN"]), _n2(rec["E-ISSN"])):
+                        if norm and norm != "no data":
+                            journals_map[norm] = {"id": new_id, "data_hash": new_hash, **journal_data}
+                    db_stats["new_records"] += 1
+                    if idx % 10 == 0 or idx == total:
+                        print(f"  -> [NEW] {rec['Full Journal Title'][:30]}", flush=True)
+                else:
+                    old_hash = existing.get("data_hash") or ""
+                    if old_hash == new_hash:
+                        # Case B: Unchanged
+                        if pipeline_run_id:
+                            touch_journal_checked(existing["id"], pipeline_run_id)
+                        db_stats["unchanged_records"] += 1
+                        if idx % 50 == 0:
+                            print(f"  -> [UNCHANGED] {idx} processed", flush=True)
+                    else:
+                        # Case C: Changed - field-level diff
+                        full_old = get_existing_full(existing["id"])
+                        changes = []
+                        # Compare journal-level fields (using same normalization as hash to suppress & vs AND etc.)
+                        for field, new_v in [("title", rec["Full Journal Title"]), ("publisher", rec["Publisher"]), ("country", rec["Country"])]:
+                            old_v = full_old["journal"].get(field if field != "title" else "title", "")
+                            if _normalize_value(old_v) != _normalize_value(new_v):
+                                changes.append(("journal", field, old_v, new_v))
+                        # Scopus
+                        for f, new_v in [("scopus_status", rec["Scopus Indexing Status"]), ("source_title", rec["Scopus Source Title"])]:
+                            old_v = full_old["scopus"].get(f, "")
+                            if _normalize_value(old_v) != _normalize_value(new_v):
+                                changes.append(("scopus", f, old_v, new_v))
+                        # MJL
+                        for f, new_v in [("mjl_status", rec["MJL Status"]), ("mjl_index", rec["MJL Index"]), ("mjl_source_title", rec["MJL Source Title"])]:
+                            old_v = full_old["mjl"].get(f, "")
+                            if _normalize_value(old_v) != _normalize_value(new_v):
+                                changes.append(("mjl", f, old_v, new_v))
+                        # SCImago
+                        for f, new_v in [("sjr", rec["SJR"]), ("quartile", rec["Quartile"]), ("h_index", rec["H-Index"]), ("coverage", rec["SCImago Coverage"]), ("scimago_status", rec["SCImago Status"])]:
+                            old_v = full_old["scimago"].get(f, "")
+                            if _normalize_value(old_v) != _normalize_value(new_v):
+                                changes.append(("scimago", f, old_v, new_v))
+                        if not changes:
+                            # Hash differed but no field diff due to normalization edge - treat as updated with hash only
+                            changes.append(("journal", "data_hash", old_hash, new_hash))
+                        update_journal_full(existing["id"], journal_data, cfr_data, scopus_data, mjl_data, scimago_data, new_hash, pipeline_run_id or "", changes)
+                        # Update map hash for next duplicate check
+                        existing["data_hash"] = new_hash
+                        db_stats["updated_records"] += 1
+                        print(f"  -> [UPDATED] {rec['Full Journal Title'][:30]} fields: {', '.join([c[1] for c in changes][:3])}", flush=True)
+
+            except Exception as e:
+                print(f"[WARNING] DB failed for {rec.get('Full Journal Title','?')[:30]}: {e}")
+                db_stats["failed_records"] += 1
+
+        db_duration = round(time.perf_counter() - db_start, 2)
+        print(f"[INFO] DB persistence complete: {db_stats['new_records']} new | {db_stats['updated_records']} updated | {db_stats['unchanged_records']} unchanged | {db_stats['failed_records']} failed in {db_duration:.2f}s", flush=True)
+        # Finish pipeline_run
+        if pipeline_run_id:
+            try:
+                total_duration = round(time.perf_counter() - pipeline_start, 2)
+                finish_pipeline_run(pipeline_run_id, "success", total_duration, {
+                    "total_cfr": len(journals),
+                    "total_scopus_active": scopus_stats.get("active_indexed", 0),
+                    "total_mjl_processed": len(eligible_pairs),
+                    "total_scimago_processed": len(eligible_pairs),
+                    "new_records": db_stats["new_records"],
+                    "updated_records": db_stats["updated_records"],
+                    "unchanged_records": db_stats["unchanged_records"],
+                    "failed_records": db_stats["failed_records"],
+                })
+            except Exception as e:
+                print(f"[WARNING] Could not finish pipeline_run: {e}")
+    else:
+        print("[INFO] Supabase not configured (set SUPABASE_URL/KEY in .env) - skipping DB, using Excel only")
+
     total_pipeline_time = round(time.perf_counter() - pipeline_start, 2)
 
-    # Write output to Excel
+    # Write output to Excel (legacy, optional)
+    # Excel is no longer source of truth; kept for debug if needed
     out_df = pd.DataFrame(results)
-    out_path = os.path.join(OUTPUT_DIR, "cfr_scopus_scimago_results.xlsx")
+    out_path = os.path.join(OUTPUT_DIR, "cfr_scopus_mjl_scimago_results.xlsx")
     try:
         out_df.to_excel(out_path, index=False)
         saved_file = out_path
     except PermissionError:
-        alt_path = os.path.join(OUTPUT_DIR, "cfr_scopus_scimago_results_latest.xlsx")
+        alt_path = os.path.join(OUTPUT_DIR, "cfr_scopus_mjl_scimago_results_latest.xlsx")
         out_df.to_excel(alt_path, index=False)
         saved_file = alt_path
 
@@ -430,19 +761,35 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"  Scopus Not Indexed        : {scopus_stats['not_indexed']}")
     print(f"  Scopus Unable to Verify   : {scopus_stats['unable_to_verify']}")
     print()
+    print(f"MJL Verification (Active)   : {len(eligible_pairs)}")
+    print(f"  MJL Found                 : {mjl_found}")
+    print(f"  MJL Not Found             : {mjl_not_found}")
+    print(f"  MJL Unable to Verify      : {mjl_unverified}")
+    print()
     print(f"Sent to SCImago (Active)    : {len(eligible_pairs)}")
     print(f"Skipped from SCImago        : {len(skipped_pairs)}")
     print(f"  SCImago Successful        : {scimago_successful}")
     print(f"  SCImago Failed            : {scimago_failed}")
     print()
+    if use_db:
+        print(f"Database (Supabase)       : {db_stats['new_records']} new | {db_stats['updated_records']} updated | {db_stats['unchanged_records']} unchanged | {db_stats['failed_records']} failed | {db_stats.get('duplicate_skipped',0)} CFR duplicate ISSN skipped")
+        print(f"  DB time                 : {db_duration:.2f} sec")
+        if db_stats.get('duplicate_skipped',0):
+            print(f"  Skipped CFR duplicates logged to skipped_records table (query: SELECT * FROM skipped_records WHERE pipeline_run_id='{pipeline_run_id}')")
+        print()
     print("--- Execution Times ---")
     print(f"CFR collection time         : {cfr_duration:.2f} sec")
     print(f"Scopus initialization       : {scopus_init_time:.2f} sec")
     print(f"Scopus verification         : {scopus_verify_time:.4f} sec")
+    print(f"MJL stage time              : {mjl_duration:.2f} sec")
     print(f"SCImago stage time          : {scimago_duration:.2f} sec")
+    if use_db:
+        print(f"DB persistence time       : {db_duration:.2f} sec")
     print(f"TOTAL PIPELINE TIME         : {total_pipeline_time:.2f} sec ({round(total_pipeline_time / 60.0, 2)} min)")
     print("========================================\n")
-    print(f"[SUCCESS] Consolidated results saved to {saved_file}")
+    if use_db and pipeline_run_id:
+        print(f"[SUCCESS] Pipeline run {pipeline_run_id} persisted to Supabase")
+    print(f"[SUCCESS] Consolidated results saved to {saved_file} (legacy Excel)")
 
 
 def main():

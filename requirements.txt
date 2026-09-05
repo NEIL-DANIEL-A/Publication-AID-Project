@@ -1,3 +1,5 @@
 scrapling[all]>=0.4.15
 pandas>=2.2.0
 openpyxl>=3.1.0
+supabase>=2.9.0
+python-dotenv>=1.0.0

@@ -1,0 +1,46 @@
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Distribution
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Project outputs - generated Excel/HTML/PNG (keeps folder but ignores contents)
+output/*
+!output/.gitkeep
+output/debug/*
+!output/debug/.gitkeep
+
+# Large datasets / caches
+data/
+
+# OS
+*.log

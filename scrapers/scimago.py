@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,6 +59,7 @@ class ScimagoScraper:
         self.headless = headless
         self.verbose = verbose
         self._stealth_session: Optional[StealthySession] = None
+        self._stealth_lock = threading.RLock()
 
     def __enter__(self):
         self.start()
@@ -85,20 +87,21 @@ class ScimagoScraper:
                 print("[INFO] Browser session closed.")
 
     def _get_stealth_session(self) -> StealthySession:
-        if self._stealth_session is None:
-            if self.verbose:
-                print("[INFO] Initializing fallback browser session...")
-            raw_session = StealthySession(
-                headless=self.headless,
-                max_pages=5,
-                disable_resources=True,
-                page_setup=_page_setup,
-                timeout=10000,
-                retries=2,
-                solve_cloudflare=True,
-            )
-            self._stealth_session = raw_session.__enter__()
-        return self._stealth_session
+        with self._stealth_lock:
+            if self._stealth_session is None:
+                if self.verbose:
+                    print("[INFO] Initializing fallback browser session...")
+                raw_session = StealthySession(
+                    headless=self.headless,
+                    max_pages=5,
+                    disable_resources=True,
+                    page_setup=_page_setup,
+                    timeout=10000,
+                    retries=2,
+                    solve_cloudflare=True,
+                )
+                self._stealth_session = raw_session.__enter__()
+            return self._stealth_session
 
     def save_debug_html(self, filename: str, content: str):
         """Save HTML response to debug directory for diagnostic analysis."""
@@ -117,6 +120,7 @@ class ScimagoScraper:
         """
         Fetch URL using fast HTTP Fetcher first.
         Fallback to StealthySession if a security challenge is detected or status is non-200.
+        Thread-safe: StealthySession access is serialized via RLock.
         """
         try:
             res = Fetcher.get(url)
@@ -124,13 +128,15 @@ class ScimagoScraper:
                 return res
             if self.verbose:
                 print(f"[INFO] Security challenge or HTTP {res.status}. Switching to stealth browser for {url}...")
-            session = self._get_stealth_session()
-            return session.fetch(url, disable_resources=True)
+            with self._stealth_lock:
+                session = self._get_stealth_session()
+                return session.fetch(url, disable_resources=True)
         except Exception as e:
             if self.verbose:
                 print(f"[WARNING] HTTP fetch failed for {url} ({e}). Retrying with stealth browser...")
-            session = self._get_stealth_session()
-            return session.fetch(url, disable_resources=True)
+            with self._stealth_lock:
+                session = self._get_stealth_session()
+                return session.fetch(url, disable_resources=True)
 
     def search_scimago(self, issn: str):
         """Open SCImago journal search URL."""
