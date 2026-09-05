@@ -1,0 +1,39 @@
+name: aid-daily
+
+on:
+  schedule:
+    - cron: '30 20 * * *'  # daily 02:00 IST (20:30 UTC)
+  workflow_dispatch: {}  # manual trigger
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          scrapling install
+          playwright install chromium --with-deps
+
+      - name: Run Publication-AID pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python main.py --workers 5
+
+      - name: Upload legacy Excel artifact (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfr-results
+          path: output/cfr_scopus_mjl_scimago_results.xlsx
+          if-no-files-found: warn
