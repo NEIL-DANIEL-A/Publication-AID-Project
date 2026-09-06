@@ -315,3 +315,100 @@ def get_skipped_records(pipeline_run_id: str) -> List[dict]:
     client = get_supabase_client()
     res = client.table("skipped_records").select("*").eq("pipeline_run_id", pipeline_run_id).execute()
     return res.data or []
+
+
+# ------------------------------------------------------------------ #
+# BULK READS (5 queries total for all journals + child tables)
+# ------------------------------------------------------------------ #
+def bulk_get_child_map(table: str, journal_ids: List[str], id_col: str = "journal_id") -> Dict[str, dict]:
+    """
+    Bulk fetch all rows from a child table for given journal_ids.
+    Returns dict: journal_id -> row (first match if multiple).
+    1 query per table.
+    """
+    if not journal_ids:
+        return {}
+    client = get_supabase_client()
+    CHUNK = 500
+    result = {}
+    for i in range(0, len(journal_ids), CHUNK):
+        chunk = journal_ids[i:i + CHUNK]
+        res = client.table(table).select("*").in_(id_col, chunk).execute()
+        for row in (res.data or []):
+            jid = row.get(id_col)
+            if jid and jid not in result:
+                result[jid] = row
+    return result
+
+
+# ------------------------------------------------------------------ #
+# BULK WRITES
+# ------------------------------------------------------------------ #
+BATCH_SIZE = 80
+
+
+def bulk_touch_journals(journal_ids: List[str], pipeline_run_id: str):
+    """Update last_checked_at + last_seen_pipeline_run_id for unchanged journals. 1 query."""
+    if not journal_ids:
+        return
+    client = get_supabase_client()
+    CHUNK = 500
+    for i in range(0, len(journal_ids), CHUNK):
+        chunk = journal_ids[i:i + CHUNK]
+        client.table("journals").update({
+            "last_checked_at": "now()",
+            "last_seen_pipeline_run_id": pipeline_run_id,
+        }).in_("id", chunk).execute()
+
+
+def bulk_update_journals(rows: List[dict]):
+    """
+    Bulk update changed journals. Each row must have 'id' key.
+    1 query (chunked).
+    """
+    if not rows:
+        return
+    client = get_supabase_client()
+    for i in range(0, len(rows), BATCH_SIZE):
+        chunk = rows[i:i + BATCH_SIZE]
+        client.table("journals").upsert(chunk, on_conflict="id").execute()
+
+
+def bulk_insert_journals(rows: List[dict]) -> List[dict]:
+    """
+    Bulk insert new journals. Returns list of inserted rows with IDs.
+    Chunked to avoid payload limits.
+    """
+    if not rows:
+        return []
+    client = get_supabase_client()
+    inserted = []
+    for i in range(0, len(rows), BATCH_SIZE):
+        chunk = rows[i:i + BATCH_SIZE]
+        res = client.table("journals").insert(chunk).execute()
+        inserted.extend(res.data or [])
+    return inserted
+
+
+def bulk_upsert_child(table: str, rows: List[dict], id_col: str = "journal_id"):
+    """
+    Bulk upsert child table rows (cfr/scopus/mjl/scimago).
+    Uses update+insert fallback since Supabase PostgREST upsert needs unique constraint.
+    1 query per chunk.
+    """
+    if not rows:
+        return
+    client = get_supabase_client()
+    for i in range(0, len(rows), BATCH_SIZE):
+        chunk = rows[i:i + BATCH_SIZE]
+        client.table(table).upsert(chunk, on_conflict=id_col).execute()
+
+
+def bulk_insert_changes(changes: List[dict]):
+    """Bulk insert journal_changes rows. 1 query."""
+    if not changes:
+        return
+    client = get_supabase_client()
+    for i in range(0, len(changes), BATCH_SIZE):
+        chunk = changes[i:i + BATCH_SIZE]
+        client.table("journal_changes").insert(chunk).execute()

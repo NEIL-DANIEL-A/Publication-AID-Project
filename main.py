@@ -27,6 +27,12 @@ try:
         create_pipeline_run,
         finish_pipeline_run,
         insert_skipped_record,
+        bulk_get_child_map,
+        bulk_touch_journals,
+        bulk_update_journals,
+        bulk_insert_journals,
+        bulk_upsert_child,
+        bulk_insert_changes,
     )
     DB_AVAILABLE = True
 except ImportError:
@@ -537,241 +543,350 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
         else:
             db_stats["duplicate_skipped"] = 0
 
-        # Bulk fetch for fast lookup (1 query vs 500+)
-        print(f"[INFO] DB: Fetching existing journals for incremental check...", flush=True)
-        bulk_start = time.perf_counter()
+        # ----------------------------------------------------------------
+        # PHASE 1: Bulk READ (5 queries total, not 500+)
+        # ----------------------------------------------------------------
+        print(f"[INFO] DB PHASE 1: Bulk fetching existing data (5 queries)...", flush=True)
+        phase1_start = time.perf_counter()
         try:
             from processors.issn import normalize_issn as _norm
             journals_map = get_all_journals_map()
             unique_journals = len(set(v["id"] for v in journals_map.values())) if journals_map else 0
-            print(f"[INFO] DB: Loaded {unique_journals} existing journals ({len(journals_map)} ISSN keys) in {time.perf_counter()-bulk_start:.2f}s (bulk, 1 query)", flush=True)
-            # Build lookup helper
-            def _lookup_existing(print_raw, e_raw):
-                for norm in (_norm(print_raw), _norm(e_raw)):
-                    if norm == "no data" or not norm:
-                        continue
-                    if norm in journals_map:
-                        return journals_map[norm]
-                return None
+            journal_ids = list(set(v["id"] for v in journals_map.values())) if journals_map else []
+            # Bulk fetch all 4 child tables (1 query each)
+            cfr_map = bulk_get_child_map("cfr_results", journal_ids)
+            scopus_map = bulk_get_child_map("scopus_results", journal_ids)
+            mjl_map = bulk_get_child_map("mjl_results", journal_ids)
+            scimago_map = bulk_get_child_map("scimago_results", journal_ids)
+            phase1_time = time.perf_counter() - phase1_start
+            print(f"[INFO] DB PHASE 1: Loaded {unique_journals} journals + {len(cfr_map)} cfr + {len(scopus_map)} scopus + {len(mjl_map)} mjl + {len(scimago_map)} scimago in {phase1_time:.2f}s (5 queries)", flush=True)
         except Exception as e:
             print(f"[WARNING] Bulk fetch failed, falling back to per-journal lookup: {e}")
             journals_map = {}
-            def _lookup_existing(print_raw, e_raw):
-                return get_journal_by_issn(print_raw, e_raw)
+            cfr_map = {}
+            scopus_map = {}
+            mjl_map = {}
+            scimago_map = {}
 
-        db_start = time.perf_counter()
+        def _lookup_existing(print_raw, e_raw):
+            for norm in (_norm(print_raw), _norm(e_raw)):
+                if norm == "no data" or not norm:
+                    continue
+                if norm in journals_map:
+                    return journals_map[norm]
+            return None
+
+        # ----------------------------------------------------------------
+        # PHASE 2: In-memory classify + hash compare + field diff (0 queries)
+        # ----------------------------------------------------------------
+        print(f"[INFO] DB PHASE 2: In-memory hash compare + field diff...", flush=True)
+        phase2_start = time.perf_counter()
+        from processors.issn import normalize_issn as _n2
+
+        to_insert_journals = []   # new journal rows
+        to_insert_cfr = []        # cfr rows for new journals
+        to_insert_scopus = []     # etc.
+        to_insert_mjl = []
+        to_insert_scimago = []
+        to_update_journals = []   # updated journal rows (with id)
+        to_update_cfr = []
+        to_update_scopus = []
+        to_update_mjl = []
+        to_update_scimago = []
+        to_touch_ids = []         # unchanged journal ids
+        all_changes = []          # journal_changes rows
+        new_issn_map = {}         # norm -> id for new journals in this run
         total = len(results)
+
         for idx, rec in enumerate(results, 1):
-            # Progress log every record (fast) + summary every 50
             if idx == 1 or idx % 50 == 0 or idx == total:
-                print(f"[DB {idx}/{total}] Processing {rec.get('Full Journal Title','?')[:35]:35} ...", flush=True)
+                print(f"[PHASE2 {idx}/{total}] {rec.get('Full Journal Title','?')[:35]:35} ...", flush=True)
+
+            # Compute new hash
+            _mjl_match_for_hash = "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped", "no data") else "Print ISSN" if rec["MJL Matched ISSN"] not in ("no data", "skipped", "") else "No Match"
+            hash_input = build_hash_input(
+                journal_title=rec["Full Journal Title"],
+                print_issn=rec["Print-ISSN"],
+                e_issn=rec["E-ISSN"],
+                publisher=rec["Publisher"],
+                country=rec["Country"],
+                cfr_sl_no=rec["Sl.No"],
+                scopus_status=rec["Scopus Indexing Status"],
+                scopus_match_type=rec["Scopus Match Type"],
+                scopus_source_title=rec["Scopus Source Title"],
+                scopus_sourcerecord_id=rec["Scopus Source Record ID"],
+                scopus_publisher=rec["Scopus Publisher"],
+                scopus_coverage=rec["Scopus Coverage"],
+                scopus_issn="",
+                scopus_eissn="",
+                scopus_raw_active="",
+                scopus_raw_discontinued="",
+                mjl_status=rec["MJL Status"],
+                mjl_index=rec["MJL Index"],
+                mjl_issn_used=rec["MJL Matched ISSN"],
+                mjl_match_type=_mjl_match_for_hash,
+                mjl_source_title=rec["MJL Source Title"],
+                scimago_status=rec["SCImago Status"],
+                scimago_journal_id=rec["SCImago Journal ID"],
+                scimago_matched_issn=rec["SCImago Matched ISSN"],
+                sjr=rec["SJR"],
+                quartile=rec["Quartile"],
+                h_index=rec["H-Index"],
+                scimago_coverage=rec["SCImago Coverage"],
+                scimago_url=rec["SCImago URL"],
+            )
+            new_hash = compute_data_hash(hash_input)
+
+            # Prepare payloads
+            norm_p = _n2(rec["Print-ISSN"])
+            norm_e = _n2(rec["E-ISSN"])
+            journal_row = {
+                "title": rec["Full Journal Title"],
+                "print_issn": rec["Print-ISSN"],
+                "e_issn": rec["E-ISSN"],
+                "normalized_print": norm_p,
+                "normalized_e": norm_e,
+                "publisher": rec["Publisher"],
+                "country": rec["Country"],
+                "data_hash": new_hash,
+            }
+            cfr_row = {
+                "sl_no": rec["Sl.No"],
+                "journal_title": rec["Full Journal Title"],
+                "print_issn": rec["Print-ISSN"],
+                "e_issn": rec["E-ISSN"],
+                "publisher": rec["Publisher"],
+                "country": rec["Country"],
+            }
+            scopus_row = {
+                "scopus_status": rec["Scopus Indexing Status"],
+                "match_type": rec["Scopus Match Type"],
+                "sourcerecord_id": rec["Scopus Source Record ID"],
+                "source_title": rec["Scopus Source Title"],
+                "scopus_publisher": rec["Scopus Publisher"],
+                "scopus_coverage": rec["Scopus Coverage"],
+                "scopus_issn": "",
+                "scopus_eissn": "",
+                "raw_active_status": "",
+                "raw_discontinued_flag": "",
+            }
+            mjl_exec = rec.get("MJL Execution Time (sec)", "no data")
             try:
-                # Build hash input from ALL extracted fields (any field change -> new hash)
-                _mjl_match_for_hash = "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped", "no data") else "Print ISSN" if rec["MJL Matched ISSN"] not in ("no data", "skipped", "") else "No Match"
-                hash_input = build_hash_input(
-                    journal_title=rec["Full Journal Title"],
-                    print_issn=rec["Print-ISSN"],
-                    e_issn=rec["E-ISSN"],
-                    publisher=rec["Publisher"],
-                    country=rec["Country"],
-                    cfr_sl_no=rec["Sl.No"],
-                    scopus_status=rec["Scopus Indexing Status"],
-                    scopus_match_type=rec["Scopus Match Type"],
-                    scopus_source_title=rec["Scopus Source Title"],
-                    scopus_sourcerecord_id=rec["Scopus Source Record ID"],
-                    scopus_publisher=rec["Scopus Publisher"],
-                    scopus_coverage=rec["Scopus Coverage"],
-                    scopus_issn="",
-                    scopus_eissn="",
-                    scopus_raw_active="",
-                    scopus_raw_discontinued="",
-                    mjl_status=rec["MJL Status"],
-                    mjl_index=rec["MJL Index"],
-                    mjl_issn_used=rec["MJL Matched ISSN"],
-                    mjl_match_type=_mjl_match_for_hash,
-                    mjl_source_title=rec["MJL Source Title"],
-                    scimago_status=rec["SCImago Status"],
-                    scimago_journal_id=rec["SCImago Journal ID"],
-                    scimago_matched_issn=rec["SCImago Matched ISSN"],
-                    sjr=rec["SJR"],
-                    quartile=rec["Quartile"],
-                    h_index=rec["H-Index"],
-                    scimago_coverage=rec["SCImago Coverage"],
-                    scimago_url=rec["SCImago URL"],
+                mjl_exec_val = float(mjl_exec) if str(mjl_exec).replace(".", "", 1).isdigit() else None
+            except:
+                mjl_exec_val = None
+            mjl_row = {
+                "mjl_status": rec["MJL Status"],
+                "mjl_index": rec["MJL Index"],
+                "mjl_issn_used": rec["MJL Matched ISSN"],
+                "mjl_match_type": "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped") else "Print ISSN",
+                "mjl_source_title": rec["MJL Source Title"],
+                "execution_time": mjl_exec_val,
+                "error": "",
+            }
+            sci_exec = rec.get("SCImago Execution Time (sec)", 0.0)
+            try:
+                sci_exec_val = float(sci_exec)
+            except:
+                sci_exec_val = 0.0
+            scimago_row = {
+                "scimago_status": rec["SCImago Status"],
+                "journal_id_external": rec["SCImago Journal ID"],
+                "matched_issn": rec["SCImago Matched ISSN"],
+                "sjr": rec["SJR"],
+                "quartile": rec["Quartile"],
+                "h_index": rec["H-Index"],
+                "coverage": rec["SCImago Coverage"],
+                "url": rec["SCImago URL"],
+                "execution_time": sci_exec_val,
+                "error": rec["SCImago Error"],
+            }
+
+            existing = _lookup_existing(rec["Print-ISSN"], rec["E-ISSN"])
+
+            if existing is None:
+                # Case A: New - collect for bulk insert
+                to_insert_journals.append(journal_row)
+                to_insert_cfr.append(cfr_row)
+                to_insert_scopus.append(scopus_row)
+                to_insert_mjl.append(mjl_row)
+                to_insert_scimago.append(scimago_row)
+                # Track for duplicate ISSN within same run
+                for norm in (norm_p, norm_e):
+                    if norm and norm != "no data":
+                        new_issn_map[norm] = len(to_insert_journals) - 1  # index into list
+                db_stats["new_records"] += 1
+            else:
+                jid = existing["id"]
+                # Recompute old hash from bulk-fetched child data (catches manual DB edits)
+                old_cfr = cfr_map.get(jid, {})
+                old_scopus = scopus_map.get(jid, {})
+                old_mjl = mjl_map.get(jid, {})
+                old_scimago = scimago_map.get(jid, {})
+                old_hash_input = build_hash_input(
+                    journal_title=existing.get("title", ""),
+                    print_issn=existing.get("print_issn", ""),
+                    e_issn=existing.get("e_issn", ""),
+                    publisher=existing.get("publisher", ""),
+                    country=existing.get("country", ""),
+                    cfr_sl_no=old_cfr.get("sl_no", ""),
+                    scopus_status=old_scopus.get("scopus_status", ""),
+                    scopus_match_type=old_scopus.get("match_type", ""),
+                    scopus_source_title=old_scopus.get("source_title", ""),
+                    scopus_sourcerecord_id=old_scopus.get("sourcerecord_id", ""),
+                    scopus_publisher=old_scopus.get("scopus_publisher", ""),
+                    scopus_coverage=old_scopus.get("scopus_coverage", ""),
+                    scopus_issn=old_scopus.get("scopus_issn", ""),
+                    scopus_eissn=old_scopus.get("scopus_eissn", ""),
+                    scopus_raw_active=old_scopus.get("raw_active_status", ""),
+                    scopus_raw_discontinued=old_scopus.get("raw_discontinued_flag", ""),
+                    mjl_status=old_mjl.get("mjl_status", ""),
+                    mjl_index=old_mjl.get("mjl_index", ""),
+                    mjl_issn_used=old_mjl.get("mjl_issn_used", ""),
+                    mjl_match_type=old_mjl.get("mjl_match_type", ""),
+                    mjl_source_title=old_mjl.get("mjl_source_title", ""),
+                    scimago_status=old_scimago.get("scimago_status", ""),
+                    scimago_journal_id=old_scimago.get("journal_id_external", ""),
+                    scimago_matched_issn=old_scimago.get("matched_issn", ""),
+                    sjr=old_scimago.get("sjr", ""),
+                    quartile=old_scimago.get("quartile", ""),
+                    h_index=old_scimago.get("h_index", ""),
+                    scimago_coverage=old_scimago.get("coverage", ""),
+                    scimago_url=old_scimago.get("url", ""),
                 )
-                new_hash = compute_data_hash(hash_input)
+                old_hash_computed = compute_data_hash(old_hash_input)
 
-                # Prepare DB payloads
-                journal_data = {
-                    "title": rec["Full Journal Title"],
-                    "print_issn": rec["Print-ISSN"],
-                    "e_issn": rec["E-ISSN"],
-                    "publisher": rec["Publisher"],
-                    "country": rec["Country"],
-                }
-                cfr_data = {
-                    "sl_no": rec["Sl.No"],
-                    "journal_title": rec["Full Journal Title"],
-                    "print_issn": rec["Print-ISSN"],
-                    "e_issn": rec["E-ISSN"],
-                    "publisher": rec["Publisher"],
-                    "country": rec["Country"],
-                }
-                scopus_data = {
-                    "scopus_status": rec["Scopus Indexing Status"],
-                    "match_type": rec["Scopus Match Type"],
-                    "sourcerecord_id": rec["Scopus Source Record ID"],
-                    "source_title": rec["Scopus Source Title"],
-                    "scopus_publisher": rec["Scopus Publisher"],
-                    "scopus_coverage": rec["Scopus Coverage"],
-                    "scopus_issn": "",
-                    "scopus_eissn": "",
-                    "raw_active_status": "",
-                    "raw_discontinued_flag": "",
-                }
-                # For skipped, execution_time is skipped string; handle
-                mjl_exec = rec.get("MJL Execution Time (sec)", "no data")
-                try:
-                    mjl_exec_val = float(mjl_exec) if str(mjl_exec).replace(".", "", 1).isdigit() else None
-                except:
-                    mjl_exec_val = None
-                mjl_data = {
-                    "mjl_status": rec["MJL Status"],
-                    "mjl_index": rec["MJL Index"],
-                    "mjl_issn_used": rec["MJL Matched ISSN"],
-                    "mjl_match_type": "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped") else "Print ISSN",
-                    "mjl_source_title": rec["MJL Source Title"],
-                    "execution_time": mjl_exec_val,
-                    "error": "",
-                }
-                sci_exec = rec.get("SCImago Execution Time (sec)", 0.0)
-                try:
-                    sci_exec_val = float(sci_exec)
-                except:
-                    sci_exec_val = 0.0
-                scimago_data = {
-                    "scimago_status": rec["SCImago Status"],
-                    "journal_id_external": rec["SCImago Journal ID"],
-                    "matched_issn": rec["SCImago Matched ISSN"],
-                    "sjr": rec["SJR"],
-                    "quartile": rec["Quartile"],
-                    "h_index": rec["H-Index"],
-                    "coverage": rec["SCImago Coverage"],
-                    "url": rec["SCImago URL"],
-                    "execution_time": sci_exec_val,
-                    "error": rec["SCImago Error"],
-                }
-
-                existing = _lookup_existing(rec["Print-ISSN"], rec["E-ISSN"])
-                if existing is None:
-                    # Case A: New
-                    new_id = insert_journal_full(journal_data, cfr_data, scopus_data, mjl_data, scimago_data, new_hash, pipeline_run_id or "")
-                    # Add to map for duplicate ISSN within same run
-                    from processors.issn import normalize_issn as _n2
-                    for norm in (_n2(rec["Print-ISSN"]), _n2(rec["E-ISSN"])):
-                        if norm and norm != "no data":
-                            journals_map[norm] = {"id": new_id, "data_hash": new_hash, **journal_data}
-                    db_stats["new_records"] += 1
-                    if idx % 10 == 0 or idx == total:
-                        print(f"  -> [NEW] {rec['Full Journal Title'][:30]}", flush=True)
+                if old_hash_computed == new_hash:
+                    # Case B: Unchanged
+                    to_touch_ids.append(jid)
+                    db_stats["unchanged_records"] += 1
                 else:
-                    # Always fetch actual DB values to detect manual edits (stored data_hash may be stale)
-                    full_old = get_existing_full(existing["id"])
-                    # Recompute old hash from actual DB values (not stored data_hash) to catch manual DB edits
-                    old_hash_input = build_hash_input(
-                        journal_title=full_old["journal"].get("title", ""),
-                        print_issn=full_old["journal"].get("print_issn", ""),
-                        e_issn=full_old["journal"].get("e_issn", ""),
-                        publisher=full_old["journal"].get("publisher", ""),
-                        country=full_old["journal"].get("country", ""),
-                        cfr_sl_no=full_old["cfr"].get("sl_no", ""),
-                        scopus_status=full_old["scopus"].get("scopus_status", ""),
-                        scopus_match_type=full_old["scopus"].get("match_type", ""),
-                        scopus_source_title=full_old["scopus"].get("source_title", ""),
-                        scopus_sourcerecord_id=full_old["scopus"].get("sourcerecord_id", ""),
-                        scopus_publisher=full_old["scopus"].get("scopus_publisher", ""),
-                        scopus_coverage=full_old["scopus"].get("scopus_coverage", ""),
-                        scopus_issn=full_old["scopus"].get("scopus_issn", ""),
-                        scopus_eissn=full_old["scopus"].get("scopus_eissn", ""),
-                        scopus_raw_active=full_old["scopus"].get("raw_active_status", ""),
-                        scopus_raw_discontinued=full_old["scopus"].get("raw_discontinued_flag", ""),
-                        mjl_status=full_old["mjl"].get("mjl_status", ""),
-                        mjl_index=full_old["mjl"].get("mjl_index", ""),
-                        mjl_issn_used=full_old["mjl"].get("mjl_issn_used", ""),
-                        mjl_match_type=full_old["mjl"].get("mjl_match_type", ""),
-                        mjl_source_title=full_old["mjl"].get("mjl_source_title", ""),
-                        scimago_status=full_old["scimago"].get("scimago_status", ""),
-                        scimago_journal_id=full_old["scimago"].get("journal_id_external", ""),
-                        scimago_matched_issn=full_old["scimago"].get("matched_issn", ""),
-                        sjr=full_old["scimago"].get("sjr", ""),
-                        quartile=full_old["scimago"].get("quartile", ""),
-                        h_index=full_old["scimago"].get("h_index", ""),
-                        scimago_coverage=full_old["scimago"].get("coverage", ""),
-                        scimago_url=full_old["scimago"].get("url", ""),
-                    )
-                    old_hash_computed = compute_data_hash(old_hash_input)
-                    if old_hash_computed == new_hash:
-                        # Case B: Unchanged (also covers manual edits reverted)
-                        if pipeline_run_id:
-                            touch_journal_checked(existing["id"], pipeline_run_id)
-                        db_stats["unchanged_records"] += 1
-                        if idx % 50 == 0:
-                            print(f"  -> [UNCHANGED] {idx} processed", flush=True)
-                    else:
-                        # Case C: Changed - field-level diff (manual edit will be detected here)
-                        changes = []
-                        # Compare journal-level fields (using same normalization as hash to suppress & vs AND etc.)
-                        for field, new_v in [("title", rec["Full Journal Title"]), ("publisher", rec["Publisher"]), ("country", rec["Country"])]:
-                            old_v = full_old["journal"].get(field if field != "title" else "title", "")
-                            if _normalize_value(old_v) != _normalize_value(new_v):
-                                changes.append(("journal", field, old_v, new_v))
-                        # CFR sl_no
-                        cfr_old_sl = full_old["cfr"].get("sl_no", "")
-                        if _normalize_value(cfr_old_sl) != _normalize_value(rec["Sl.No"]):
-                            changes.append(("cfr", "sl_no", cfr_old_sl, rec["Sl.No"]))
-                        # Scopus - all extracted fields (any change tracked)
-                        for f, new_v in [
-                            ("scopus_status", rec["Scopus Indexing Status"]),
-                            ("match_type", rec["Scopus Match Type"]),
-                            ("source_title", rec["Scopus Source Title"]),
-                            ("sourcerecord_id", rec["Scopus Source Record ID"]),
-                            ("scopus_publisher", rec["Scopus Publisher"]),
-                            ("scopus_coverage", rec["Scopus Coverage"]),
-                        ]:
-                            old_v = full_old["scopus"].get(f, "")
-                            if _normalize_value(old_v) != _normalize_value(new_v):
-                                changes.append(("scopus", f, old_v, new_v))
-                        # MJL - all fields
-                        _new_mjl_match = "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped", "no data") else "Print ISSN" if rec["MJL Matched ISSN"] not in ("no data", "skipped", "") else "No Match"
-                        for f, new_v in [("mjl_status", rec["MJL Status"]), ("mjl_index", rec["MJL Index"]), ("mjl_issn_used", rec["MJL Matched ISSN"]), ("mjl_match_type", _new_mjl_match), ("mjl_source_title", rec["MJL Source Title"])]:
-                            old_v = full_old["mjl"].get(f, "")
-                            if _normalize_value(old_v) != _normalize_value(new_v):
-                                changes.append(("mjl", f, old_v, new_v))
-                        # SCImago - all fields
-                        for f, new_v in [
-                            ("sjr", rec["SJR"]), ("quartile", rec["Quartile"]), ("h_index", rec["H-Index"]),
-                            ("coverage", rec["SCImago Coverage"]), ("scimago_status", rec["SCImago Status"]),
-                            ("journal_id_external", rec["SCImago Journal ID"]), ("matched_issn", rec["SCImago Matched ISSN"]),
-                            ("url", rec["SCImago URL"]),
-                        ]:
-                            old_v = full_old["scimago"].get(f, "")
-                            if _normalize_value(old_v) != _normalize_value(new_v):
-                                changes.append(("scimago", f, old_v, new_v))
-                        if not changes:
-                            # Hash differed but no field diff due to normalization edge - treat as updated with hash only
-                            changes.append(("journal", "data_hash", old_hash, new_hash))
-                        update_journal_full(existing["id"], journal_data, cfr_data, scopus_data, mjl_data, scimago_data, new_hash, pipeline_run_id or "", changes)
-                        # Update map hash for next duplicate check
-                        existing["data_hash"] = new_hash
-                        db_stats["updated_records"] += 1
-                        print(f"  -> [UPDATED] {rec['Full Journal Title'][:30]} fields: {', '.join([c[1] for c in changes][:3])}", flush=True)
+                    # Case C: Changed - field-level diff
+                    changes = []
+                    for field, new_v in [("title", rec["Full Journal Title"]), ("publisher", rec["Publisher"]), ("country", rec["Country"])]:
+                        old_v = existing.get(field, "")
+                        if _normalize_value(old_v) != _normalize_value(new_v):
+                            changes.append(("journal", field, old_v, new_v))
+                    cfr_old_sl = old_cfr.get("sl_no", "")
+                    if _normalize_value(cfr_old_sl) != _normalize_value(rec["Sl.No"]):
+                        changes.append(("cfr", "sl_no", cfr_old_sl, rec["Sl.No"]))
+                    for f, new_v in [
+                        ("scopus_status", rec["Scopus Indexing Status"]),
+                        ("match_type", rec["Scopus Match Type"]),
+                        ("source_title", rec["Scopus Source Title"]),
+                        ("sourcerecord_id", rec["Scopus Source Record ID"]),
+                        ("scopus_publisher", rec["Scopus Publisher"]),
+                        ("scopus_coverage", rec["Scopus Coverage"]),
+                    ]:
+                        old_v = old_scopus.get(f, "")
+                        if _normalize_value(old_v) != _normalize_value(new_v):
+                            changes.append(("scopus", f, old_v, new_v))
+                    _new_mjl_match = "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped", "no data") else "Print ISSN" if rec["MJL Matched ISSN"] not in ("no data", "skipped", "") else "No Match"
+                    for f, new_v in [("mjl_status", rec["MJL Status"]), ("mjl_index", rec["MJL Index"]), ("mjl_issn_used", rec["MJL Matched ISSN"]), ("mjl_match_type", _new_mjl_match), ("mjl_source_title", rec["MJL Source Title"])]:
+                        old_v = old_mjl.get(f, "")
+                        if _normalize_value(old_v) != _normalize_value(new_v):
+                            changes.append(("mjl", f, old_v, new_v))
+                    for f, new_v in [
+                        ("sjr", rec["SJR"]), ("quartile", rec["Quartile"]), ("h_index", rec["H-Index"]),
+                        ("coverage", rec["SCImago Coverage"]), ("scimago_status", rec["SCImago Status"]),
+                        ("journal_id_external", rec["SCImago Journal ID"]), ("matched_issn", rec["SCImago Matched ISSN"]),
+                        ("url", rec["SCImago URL"]),
+                    ]:
+                        old_v = old_scimago.get(f, "")
+                        if _normalize_value(old_v) != _normalize_value(new_v):
+                            changes.append(("scimago", f, old_v, new_v))
+                    if not changes:
+                        changes.append(("journal", "data_hash", old_hash_computed, new_hash))
 
-            except Exception as e:
-                print(f"[WARNING] DB failed for {rec.get('Full Journal Title','?')[:30]}: {e}")
-                db_stats["failed_records"] += 1
+                    # Collect for bulk update
+                    journal_row["id"] = jid
+                    journal_row["last_changed_at"] = "now()"
+                    to_update_journals.append(journal_row)
+                    cfr_row["journal_id"] = jid
+                    to_update_cfr.append(cfr_row)
+                    scopus_row["journal_id"] = jid
+                    to_update_scopus.append(scopus_row)
+                    mjl_row["journal_id"] = jid
+                    to_update_mjl.append(mjl_row)
+                    scimago_row["journal_id"] = jid
+                    to_update_scimago.append(scimago_row)
+                    for src, fld, old_v, new_v in changes:
+                        all_changes.append({
+                            "journal_id": jid,
+                            "pipeline_run_id": pipeline_run_id or "",
+                            "source": src,
+                            "field_name": fld,
+                            "old_value": str(old_v) if old_v is not None else None,
+                            "new_value": str(new_v) if new_v is not None else None,
+                        })
+                    db_stats["updated_records"] += 1
 
-        db_duration = round(time.perf_counter() - db_start, 2)
-        print(f"[INFO] DB persistence complete: {db_stats['new_records']} new | {db_stats['updated_records']} updated | {db_stats['unchanged_records']} unchanged | {db_stats['failed_records']} failed in {db_duration:.2f}s", flush=True)
+        phase2_time = time.perf_counter() - phase2_start
+        print(f"[INFO] DB PHASE 2: Classified {db_stats['new_records']} new | {db_stats['updated_records']} updated | {db_stats['unchanged_records']} unchanged in {phase2_time:.3f}s (0 queries)", flush=True)
+
+        # ----------------------------------------------------------------
+        # PHASE 3: Bulk WRITE (9 queries total, not 500+)
+        # ----------------------------------------------------------------
+        print(f"[INFO] DB PHASE 3: Bulk writing to Supabase...", flush=True)
+        phase3_start = time.perf_counter()
+
+        # 1. Bulk insert NEW journals (get IDs back for child tables)
+        new_ids = []
+        if to_insert_journals:
+            print(f"  [WRITE] Inserting {len(to_insert_journals)} new journals...", flush=True)
+            inserted = bulk_insert_journals(to_insert_journals)
+            new_ids = [r["id"] for r in inserted]
+            # Assign journal_id to child rows
+            for i, jid in enumerate(new_ids):
+                to_insert_cfr[i]["journal_id"] = jid
+                to_insert_scopus[i]["journal_id"] = jid
+                to_insert_mjl[i]["journal_id"] = jid
+                to_insert_scimago[i]["journal_id"] = jid
+            # Update new_issn_map with real IDs
+            for i, jid in enumerate(new_ids):
+                norm_p_i = to_insert_journals[i].get("normalized_print", "")
+                norm_e_i = to_insert_journals[i].get("normalized_e", "")
+                if norm_p_i and norm_p_i != "no data":
+                    new_issn_map[norm_p_i] = jid
+                if norm_e_i and norm_e_i != "no data":
+                    new_issn_map[norm_e_i] = jid
+
+        # 2-5. Bulk upsert child tables for NEW journals
+        bulk_upsert_child("cfr_results", to_insert_cfr)
+        bulk_upsert_child("scopus_results", to_insert_scopus)
+        bulk_upsert_child("mjl_results", to_insert_mjl)
+        bulk_upsert_child("scimago_results", to_insert_scimago)
+
+        # 6. Bulk update CHANGED journals
+        if to_update_journals:
+            print(f"  [WRITE] Updating {len(to_update_journals)} changed journals...", flush=True)
+            bulk_update_journals(to_update_journals)
+
+        # 7-10. Bulk upsert child tables for CHANGED journals
+        bulk_upsert_child("cfr_results", to_update_cfr)
+        bulk_upsert_child("scopus_results", to_update_scopus)
+        bulk_upsert_child("mjl_results", to_update_mjl)
+        bulk_upsert_child("scimago_results", to_update_scimago)
+
+        # 11. Bulk touch UNCHANGED journals (1 query)
+        if to_touch_ids:
+            print(f"  [WRITE] Touching {len(to_touch_ids)} unchanged journals...", flush=True)
+            bulk_touch_journals(to_touch_ids, pipeline_run_id or "")
+
+        # 12. Bulk insert CHANGES
+        if all_changes:
+            print(f"  [WRITE] Inserting {len(all_changes)} change records...", flush=True)
+            bulk_insert_changes(all_changes)
+
+        # Log updated field summaries
+        if db_stats["updated_records"] > 0:
+            field_counts = collections.Counter(c["source"] for c in all_changes)
+            print(f"  [UPDATED] Field changes: {dict(field_counts)}", flush=True)
+
+        phase3_time = time.perf_counter() - phase3_start
+        db_duration = round(phase1_time + phase2_time + phase3_time, 2)
+        print(f"[INFO] DB PHASE 3: Bulk write complete in {phase3_time:.2f}s", flush=True)
+        print(f"[INFO] DB persistence complete: {db_stats['new_records']} new | {db_stats['updated_records']} updated | {db_stats['unchanged_records']} unchanged | {db_stats['failed_records']} failed in {db_duration:.2f}s (was ~62s)", flush=True)
         # Finish pipeline_run
         if pipeline_run_id:
             try:
