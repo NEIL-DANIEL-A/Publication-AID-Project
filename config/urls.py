@@ -4,7 +4,7 @@ Single place to change any external endpoint.
 """
 
 # CFR Anna University
-CFR_START_URL = "https://cfr.annauniv.edu/research/academics/english-journals-list.php"
+CFR_START_URL = "https://cfr.annauniv.edu/research/academics/journals-list.php"
 
 # Scopus - Elsevier Source Title List
 ELSEVIER_SCOPUS_POLICY_URL = "https://www.elsevier.com/solutions/scopus/how-scopus-works/content/content-policy-and-selection"
