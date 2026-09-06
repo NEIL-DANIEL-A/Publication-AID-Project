@@ -7,6 +7,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
+from config.urls import DEBUG_SUBDIR, OUTPUT_DIR_NAME, SCIMAGO_JOURNAL_BASE as JOURNAL_BASE_URL, SCIMAGO_SEARCH_BASE as SEARCH_BASE_URL
 from scrapling.core.utils._utils import log as scrapling_log
 from scrapling.fetchers import Fetcher, StealthySession
 from models import JournalResult
@@ -15,9 +16,7 @@ from processors.issn import normalize_issn
 # Silence Scrapling's verbose internal fetch logs
 scrapling_log.setLevel(logging.WARNING)
 
-SEARCH_BASE_URL = "https://www.scimagojr.com/journalsearch.php?q={issn}"
-JOURNAL_BASE_URL = "https://www.scimagojr.com/journalsearch.php?q={journal_id}&tip=sid&clean=0"
-DEBUG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output", "debug")
+DEBUG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), OUTPUT_DIR_NAME, DEBUG_SUBDIR)
 
 
 def is_challenge_page(text: str) -> bool:

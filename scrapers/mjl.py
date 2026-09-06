@@ -33,12 +33,10 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
+from config.urls import MJL_API_PATTERN, MJL_API_URL, MJL_HOME_URL, MJL_SEARCH_BASE
 from models import CFRJournal, MJLVerificationResult
 from processors.issn import normalize_issn
 
-MJL_SEARCH_BASE = "https://mjl.clarivate.com/search-results?issn={issn}"
-MJL_API_URL = "https://mjl.clarivate.com/api/mjl/jprof/public/rank-search"
-MJL_API_PATTERN = "rank-search"
 DEFAULT_TIMEOUT_S = 10
 COOKIE_ACCEPT_ID = "onetrust-accept-btn-handler"
 
@@ -163,7 +161,7 @@ def _parse_mjl_response(response_text: str, searched_norm_issn: str) -> Tuple[st
 # --------------------------------------------------------------------------- #
 
 _MJL_HEADERS = {
-    "Referer": "https://mjl.clarivate.com/search-results",
+    "Referer": MJL_HOME_URL,
     "X-1P-AppId": "mjl",
     "Authorization": "Bearer",
     "Accept": "application/json, text/plain, */*",
@@ -274,7 +272,7 @@ class MJLVerifier:
         )
         self._page = self._context.new_page()
         try:
-            self._page.goto("https://mjl.clarivate.com/search-results", wait_until="domcontentloaded", timeout=15_000)
+            self._page.goto(MJL_HOME_URL, wait_until="domcontentloaded", timeout=15_000)
             time.sleep(4)
             self._remove_overlays()
         except Exception:

@@ -20,10 +20,13 @@ from typing import List, Optional, Set, Tuple
 from scrapling.fetchers import Fetcher
 from scrapling.parser import Adaptor
 
+from config.urls import CFR_START_URL as START_URL
+from config.urls import DEBUG_SUBDIR, OUTPUT_DIR_NAME
 from models import CFRJournal
 
-START_URL = "https://cfr.annauniv.edu/research/academics/english-journals-list.php"
-DEBUG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output", "debug")
+# Keep alias for backwards compatibility
+# START_URL imported from config.urls
+DEBUG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), OUTPUT_DIR_NAME, DEBUG_SUBDIR)
 
 
 def save_cfr_debug_html(filename: str, content: str):

@@ -36,7 +36,7 @@ REQUIRED_COLUMNS = [
     COL_PUBLISHER,
 ]
 
-ELSEVIER_SCOPUS_POLICY_URL = "https://www.elsevier.com/solutions/scopus/how-scopus-works/content/content-policy-and-selection"
+from config.urls import ELSEVIER_SCOPUS_POLICY_URL
 
 
 def download_scopus_dataset(dest_path: str) -> bool:
