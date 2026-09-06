@@ -566,24 +566,30 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             if idx == 1 or idx % 50 == 0 or idx == total:
                 print(f"[DB {idx}/{total}] Processing {rec.get('Full Journal Title','?')[:35]:35} ...", flush=True)
             try:
-                # Build hash input from all sources
+                # Build hash input from ALL extracted fields (any field change -> new hash)
+                # Compute mjl_match_type as stored in DB for consistent hashing
+                _mjl_match_for_hash = "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped", "no data") else "Print ISSN" if rec["MJL Matched ISSN"] != "no data" and rec["MJL Matched ISSN"] != "skipped" else "No Match"
                 hash_input = build_hash_input(
                     journal_title=rec["Full Journal Title"],
                     print_issn=rec["Print-ISSN"],
                     e_issn=rec["E-ISSN"],
                     publisher=rec["Publisher"],
                     country=rec["Country"],
+                    cfr_sl_no=rec["Sl.No"],
                     scopus_status=rec["Scopus Indexing Status"],
                     scopus_match_type=rec["Scopus Match Type"],
                     scopus_source_title=rec["Scopus Source Title"],
                     scopus_sourcerecord_id=rec["Scopus Source Record ID"],
                     scopus_publisher=rec["Scopus Publisher"],
                     scopus_coverage=rec["Scopus Coverage"],
-                    scopus_issn="",  # stored in scopus_results but not in record
+                    scopus_issn="",  # stored but not in record - keep "" for now
                     scopus_eissn="",
+                    scopus_raw_active="",
+                    scopus_raw_discontinued="",
                     mjl_status=rec["MJL Status"],
                     mjl_index=rec["MJL Index"],
                     mjl_issn_used=rec["MJL Matched ISSN"],
+                    mjl_match_type=_mjl_match_for_hash,
                     mjl_source_title=rec["MJL Source Title"],
                     scimago_status=rec["SCImago Status"],
                     scimago_journal_id=rec["SCImago Journal ID"],
@@ -687,18 +693,35 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                             old_v = full_old["journal"].get(field if field != "title" else "title", "")
                             if _normalize_value(old_v) != _normalize_value(new_v):
                                 changes.append(("journal", field, old_v, new_v))
-                        # Scopus
-                        for f, new_v in [("scopus_status", rec["Scopus Indexing Status"]), ("source_title", rec["Scopus Source Title"])]:
+                        # CFR sl_no (now part of hash)
+                        cfr_old_sl = full_old["cfr"].get("sl_no", "")
+                        if _normalize_value(cfr_old_sl) != _normalize_value(rec["Sl.No"]):
+                            changes.append(("cfr", "sl_no", cfr_old_sl, rec["Sl.No"]))
+                        # Scopus - compare all hash-relevant fields
+                        for f, new_v in [
+                            ("scopus_status", rec["Scopus Indexing Status"]),
+                            ("match_type", rec["Scopus Match Type"]),
+                            ("source_title", rec["Scopus Source Title"]),
+                            ("sourcerecord_id", rec["Scopus Source Record ID"]),
+                            ("scopus_publisher", rec["Scopus Publisher"]),
+                            ("scopus_coverage", rec["Scopus Coverage"]),
+                        ]:
                             old_v = full_old["scopus"].get(f, "")
                             if _normalize_value(old_v) != _normalize_value(new_v):
                                 changes.append(("scopus", f, old_v, new_v))
-                        # MJL
-                        for f, new_v in [("mjl_status", rec["MJL Status"]), ("mjl_index", rec["MJL Index"]), ("mjl_source_title", rec["MJL Source Title"])]:
+                        # MJL - all fields including match_type (now in hash)
+                        _new_mjl_match = "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped", "no data") else "Print ISSN" if rec["MJL Matched ISSN"] not in ("no data", "skipped", "") else "No Match"
+                        for f, new_v in [("mjl_status", rec["MJL Status"]), ("mjl_index", rec["MJL Index"]), ("mjl_issn_used", rec["MJL Matched ISSN"]), ("mjl_match_type", _new_mjl_match), ("mjl_source_title", rec["MJL Source Title"])]:
                             old_v = full_old["mjl"].get(f, "")
                             if _normalize_value(old_v) != _normalize_value(new_v):
                                 changes.append(("mjl", f, old_v, new_v))
-                        # SCImago
-                        for f, new_v in [("sjr", rec["SJR"]), ("quartile", rec["Quartile"]), ("h_index", rec["H-Index"]), ("coverage", rec["SCImago Coverage"]), ("scimago_status", rec["SCImago Status"])]:
+                        # SCImago - all fields
+                        for f, new_v in [
+                            ("sjr", rec["SJR"]), ("quartile", rec["Quartile"]), ("h_index", rec["H-Index"]),
+                            ("coverage", rec["SCImago Coverage"]), ("scimago_status", rec["SCImago Status"]),
+                            ("journal_id_external", rec["SCImago Journal ID"]), ("matched_issn", rec["SCImago Matched ISSN"]),
+                            ("url", rec["SCImago URL"]),
+                        ]:
                             old_v = full_old["scimago"].get(f, "")
                             if _normalize_value(old_v) != _normalize_value(new_v):
                                 changes.append(("scimago", f, old_v, new_v))
