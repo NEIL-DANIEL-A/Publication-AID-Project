@@ -933,6 +933,32 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
         # 1. Bulk insert NEW journals (get IDs back for child tables)
         new_ids = []
         if to_insert_journals:
+            # Deduplicate by normalized_print ISSN to avoid constraint violations
+            seen_print = set()
+            dedup_journals = []
+            dedup_cfr = []
+            dedup_scopus = []
+            dedup_mjl = []
+            dedup_scimago = []
+            for i, j in enumerate(to_insert_journals):
+                np = j.get("normalized_print", "")
+                if np and np != "no data" and np in seen_print:
+                    continue
+                if np and np != "no data":
+                    seen_print.add(np)
+                dedup_journals.append(j)
+                dedup_cfr.append(to_insert_cfr[i])
+                dedup_scopus.append(to_insert_scopus[i])
+                dedup_mjl.append(to_insert_mjl[i])
+                dedup_scimago.append(to_insert_scimago[i])
+            if len(dedup_journals) < len(to_insert_journals):
+                print(f"  [DEDUP] Removed {len(to_insert_journals) - len(dedup_journals)} duplicate ISSN journals", flush=True)
+            to_insert_journals = dedup_journals
+            to_insert_cfr = dedup_cfr
+            to_insert_scopus = dedup_scopus
+            to_insert_mjl = dedup_mjl
+            to_insert_scimago = dedup_scimago
+
             print(f"  [WRITE] Inserting {len(to_insert_journals)} new journals...", flush=True)
             inserted = bulk_insert_journals(to_insert_journals)
             new_ids = [r["id"] for r in inserted]
