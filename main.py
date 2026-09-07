@@ -301,11 +301,17 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     # Build sl_no -> APC lookup for eligible journals
     apc_lookup = {}
     for j, _ in eligible_pairs:
+        # First try ISSN-based lookup
         for issn in (j.print_issn, j.e_issn):
             entry = apc_verifier.lookup(issn)
             if entry:
                 apc_lookup[j.sl_no] = entry
                 break
+        # If no ISSN match, try title-based lookup (for SAGE Gold OA)
+        if j.sl_no not in apc_lookup:
+            entry = apc_verifier.lookup_by_title(j.journal_title)
+            if entry:
+                apc_lookup[j.sl_no] = entry
 
     apc_duration = round(time.perf_counter() - apc_start_time, 2)
     apc_found_count = len(apc_lookup)
@@ -318,6 +324,8 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"  Wiley Hybrid        : {apc_verifier.stats.get('wiley_hybrid_count', 0)}")
     print(f"  Elsevier            : {apc_verifier.stats.get('elsevier_count', 0)}")
     print(f"  Springer Nature     : {apc_verifier.stats.get('springer_count', 0)}")
+    print(f"  Oxford Univ Press   : {apc_verifier.stats.get('oup_count', 0)}")
+    print(f"  SAGE                : {apc_verifier.stats.get('sage_count', 0)}")
     print(f"  APC Stage Time      : {apc_duration:.2f} sec")
     print(f"--------------------------------\n")
 

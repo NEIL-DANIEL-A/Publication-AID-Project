@@ -13,7 +13,7 @@ APC_SOURCES = {
             "header_row": 6,
             "issn_col": "Online ISSN",
             "apc_col": "USD",
-            "mode_col": "License Types Offered",
+            "mode_col": "",
         },
         {
             "name": "Wiley Hybrid",
@@ -23,7 +23,7 @@ APC_SOURCES = {
             "header_row": 6,
             "issn_col": "Online\nISSN",
             "apc_col": "USD $",
-            "mode_col": "License types offered",
+            "mode_col": "",
         },
     ],
     "Elsevier": [
@@ -36,6 +36,45 @@ APC_SOURCES = {
             "issn_col": "ISSN",
             "apc_col": "USD",
             "mode_col": "Business model",
+        },
+    ],
+    "Oxford University Press": [
+        {
+            "name": "OUP APC",
+            "url": "https://academic.oup.com/pages/open-research/open-access/charges-licences-and-self-archiving",
+            "filename": "OUP_Charges.xlsx",
+            "direct_url": "https://global.oup.com/fdscontent/academic/xls/openaccess/charges.xlsx",
+            "header_row": 0,
+            "issn_col": "ISSN",
+            "apc_col": "APC rate",
+            "apc_currency_col": "APC Base Currency",
+            "mode_col": "Journal Type",
+        },
+    ],
+    "SAGE": [
+        {
+            "name": "SAGE Hybrid",
+            "url": "https://www.sagepub.com/journals/information-for-authors/publishing-options",
+            "filename": "SAGE_Hybrid.xlsx",
+            "direct_url": "https://www.sagepub.com/docs/default-source/rp-pages/info-for-authors/hybrid-oa-sage-choice/sage-choice-price-list-2026---external.xlsx?sfvrsn=4e6e819b_8",
+            "header_row": 0,
+            "issn_col": "ISSN",
+            "apc_col": "2026 OA APC ($)",
+            "apc_gbp_col": "2026 OA APC (£)",
+            "mode_label": "hybrid",
+        },
+        {
+            "name": "SAGE Gold OA",
+            "url": "https://www.sagepub.com/journals/information-for-authors/publishing-options",
+            "filename": "SAGE_Gold_OA.xlsx",
+            "direct_url": "https://www.sagepub.com/docs/default-source/rp-pages/info-for-authors/sage-gold-oa-apcs-2026.xlsx?sfvrsn=5f7181ea_6",
+            "header_row": 0,
+            "issn_col": "",
+            "apc_col": "Current Price 2026",
+            "apc_gbp_col": "",
+            "mode_label": "GOLD OA",
+            "title_col": "Journal Title1",
+            "currency_col": "Currency",
         },
     ],
     "Springer Nature": [
@@ -67,9 +106,11 @@ APC_SOURCES = {
 # Column aliases: map lowercase/variant header names to canonical name
 # Used by _find_column() for flexible matching across header variations
 APC_COLUMN_ALIASES = {
-    "issn": ["issn", "print issn", "issn (print)", "issn print", "print_issn", "journal issn"],
+    "issn": ["issn", "print issn", "issn (print)", "issn print", "print_issn", "journal issn", "online issn", "e-issn", "eissn"],
     "apc_usd": ["apc (usd)", "apc usd", "usd", "price (usd)", "cost (usd)", "apc"],
     "apc_eur": ["apc (eur)", "apc eur", "eur", "price (eur)", "cost (eur)"],
     "apc_gbp": ["apc (gbp)", "apc gbp", "gbp", "price (gbp)", "cost (gbp)"],
-    "mode": ["oa type", "mode", "open access type", "onlineopen category", "access type", "type", "oa mode"],
+    "apc_rate": ["apc rate", "apc rate (gbp)", "apc rate (usd)", "apc rate (eur)", "rate", "charge", "apc charge"],
+    "apc_currency": ["apc base currency", "currency", "base currency", "apc currency"],
+    "mode": ["oa type", "mode", "open access type", "onlineopen category", "access type", "type", "oa mode", "journal type"],
 }
