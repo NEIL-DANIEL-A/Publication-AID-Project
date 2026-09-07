@@ -44,3 +44,24 @@ def test_hash_changed_field():
     base = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", h_index="400", quartile="Q1")
     changed = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", h_index="401", quartile="Q1")
     assert compute_data_hash(base) != compute_data_hash(changed)
+
+
+def test_hash_apc_aggregate():
+    """Test that APC aggregate changes are detected in hash."""
+    base = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", apc_aggregate="springer nature:usd:3290")
+    with_apc = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", apc_aggregate="springer nature:usd:3500")
+    assert compute_data_hash(base) != compute_data_hash(with_apc)
+
+
+def test_hash_apc_mode_aggregate():
+    """Test that APC mode changes are detected in hash."""
+    base = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", apc_mode_aggregate="hybrid")
+    with_mode = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", apc_mode_aggregate="gold")
+    assert compute_data_hash(base) != compute_data_hash(with_mode)
+
+
+def test_hash_apc_empty_vs_no_data():
+    """Test that empty APC and no-data APC hash to same value."""
+    rec1 = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", apc_aggregate="", apc_mode_aggregate="")
+    rec2 = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", apc_aggregate="no data", apc_mode_aggregate="no data")
+    assert compute_data_hash(rec1) == compute_data_hash(rec2)

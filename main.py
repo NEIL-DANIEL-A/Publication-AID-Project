@@ -28,11 +28,13 @@ try:
         finish_pipeline_run,
         insert_skipped_record,
         bulk_get_child_map,
+        bulk_get_apc_map,
         bulk_touch_journals,
         bulk_update_journals,
         bulk_insert_journals,
         bulk_upsert_child,
         bulk_insert_changes,
+        bulk_upsert_apc,
     )
     DB_AVAILABLE = True
 except ImportError:
@@ -285,9 +287,39 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"  Scopus Unable to Verify : {scopus_stats['unable_to_verify']}")
     print("-----------------------------------\n")
 
-    # Stage 3: MJL Index Verification (Clarivate Web of Science) - Hybrid
+    # Stage 2b: APC Verification (only for Active/Indexed journals)
     eligible_pairs = [(j, s) for j, s in verified_pairs if s.scopus_status == "Active / Indexed"]
     skipped_pairs  = [(j, s) for j, s in verified_pairs if s.scopus_status != "Active / Indexed"]
+
+    print(f"[INFO] Stage 2b: APC Verification (Active/Indexed: {len(eligible_pairs)} journals)...")
+    apc_start_time = time.perf_counter()
+
+    from scrapers.apc import APCVerifier
+    apc_verifier = APCVerifier()
+    apc_verifier.load_all()
+
+    # Build sl_no -> APC lookup for eligible journals
+    apc_lookup = {}
+    for j, _ in eligible_pairs:
+        for issn in (j.print_issn, j.e_issn):
+            entry = apc_verifier.lookup(issn)
+            if entry:
+                apc_lookup[j.sl_no] = entry
+                break
+
+    apc_duration = round(time.perf_counter() - apc_start_time, 2)
+    apc_found_count = len(apc_lookup)
+    apc_not_found = len(eligible_pairs) - apc_found_count
+
+    print(f"\n--- APC Verification Summary ---")
+    print(f"  APC Found           : {apc_found_count}")
+    print(f"  APC Not Found       : {apc_not_found}")
+    print(f"  Wiley OA            : {apc_verifier.stats.get('wiley_oa_count', 0)}")
+    print(f"  Wiley Hybrid        : {apc_verifier.stats.get('wiley_hybrid_count', 0)}")
+    print(f"  Elsevier            : {apc_verifier.stats.get('elsevier_count', 0)}")
+    print(f"  Springer Nature     : {apc_verifier.stats.get('springer_count', 0)}")
+    print(f"  APC Stage Time      : {apc_duration:.2f} sec")
+    print(f"--------------------------------\n")
 
     print(f"[INFO] Stage 3: MJL Index Verification (Active/Indexed: {len(eligible_pairs)} journals)...")
     mjl_start_time = time.perf_counter()
@@ -378,6 +410,12 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
         mjl_issn_val    = m_res.mjl_issn_used    if m_res else "no data"
         mjl_title_val   = m_res.mjl_source_title if m_res else "no data"
 
+        # APC data (from Stage 2b, only for Active/Indexed)
+        apc_res = apc_lookup.get(j.sl_no)
+        apc_value_val = apc_res.get("apc_value", "no data") if apc_res else "no data"
+        apc_currency_val = apc_res.get("apc_currency", "no data") if apc_res else "no data"
+        apc_mode_val = apc_res.get("mode_raw", "no data") if apc_res else "no data"
+
         record = {
             "Sl.No": j.sl_no,
             "Full Journal Title": j.journal_title,
@@ -405,6 +443,9 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             "SCImago Status": status_display,
             "SCImago Error": err_display,
             "SCImago Execution Time (sec)": j_time,
+            "APC Value": apc_value_val,
+            "APC Currency": apc_currency_val,
+            "APC Mode": apc_mode_val,
         }
 
         return idx, record, is_success, j_time, j.journal_title, s_res.scopus_status, sjr_val, q_val, status_display
@@ -471,6 +512,9 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             "SCImago Status": "skipped (not active in Scopus)",
             "SCImago Error": "",
             "SCImago Execution Time (sec)": 0.0,
+            "APC Value": "no data",
+            "APC Currency": "no data",
+            "APC Mode": "no data",
         })
 
     # ------------------------------------------------------------------ #
@@ -511,22 +555,23 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             db_stats["duplicate_skipped"] = 0
 
         # ----------------------------------------------------------------
-        # PHASE 1: Bulk READ (5 queries total, not 500+)
+        # PHASE 1: Bulk READ (6 queries total, not 500+)
         # ----------------------------------------------------------------
-        print(f"[INFO] DB PHASE 1: Bulk fetching existing data (5 queries)...", flush=True)
+        print(f"[INFO] DB PHASE 1: Bulk fetching existing data (6 queries)...", flush=True)
         phase1_start = time.perf_counter()
         try:
             from processors.issn import normalize_issn as _norm
             journals_map = get_all_journals_map()
             unique_journals = len(set(v["id"] for v in journals_map.values())) if journals_map else 0
             journal_ids = list(set(v["id"] for v in journals_map.values())) if journals_map else []
-            # Bulk fetch all 4 child tables (1 query each)
+            # Bulk fetch all 5 child tables (1 query each)
             cfr_map = bulk_get_child_map("cfr_results", journal_ids)
             scopus_map = bulk_get_child_map("scopus_results", journal_ids)
             mjl_map = bulk_get_child_map("mjl_results", journal_ids)
             scimago_map = bulk_get_child_map("scimago_results", journal_ids)
+            apc_map = bulk_get_apc_map(journal_ids)
             phase1_time = time.perf_counter() - phase1_start
-            print(f"[INFO] DB PHASE 1: Loaded {unique_journals} journals + {len(cfr_map)} cfr + {len(scopus_map)} scopus + {len(mjl_map)} mjl + {len(scimago_map)} scimago in {phase1_time:.2f}s (5 queries)", flush=True)
+            print(f"[INFO] DB PHASE 1: Loaded {unique_journals} journals + {len(cfr_map)} cfr + {len(scopus_map)} scopus + {len(mjl_map)} mjl + {len(scimago_map)} scimago + {len(apc_map)} apc in {phase1_time:.2f}s (6 queries)", flush=True)
         except Exception as e:
             print(f"[WARNING] Bulk fetch failed, falling back to per-journal lookup: {e}")
             journals_map = {}
@@ -534,6 +579,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             scopus_map = {}
             mjl_map = {}
             scimago_map = {}
+            apc_map = {}
 
         def _lookup_existing(print_raw, e_raw):
             for norm in (_norm(print_raw), _norm(e_raw)):
@@ -542,6 +588,35 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                 if norm in journals_map:
                     return journals_map[norm]
             return None
+
+        def _compute_apc_aggregate(apc_entries: List[dict]) -> str:
+            """Compute deterministic aggregate string from APC records for hashing."""
+            if not apc_entries:
+                return ""
+            # Sort by publisher+currency+value for deterministic order
+            sorted_entries = sorted(apc_entries, key=lambda e: (
+                _normalize_value(e.get("publisher", "")),
+                _normalize_value(e.get("apc_currency", "")),
+                _normalize_value(e.get("apc_value", "")),
+            ))
+            parts = []
+            for e in sorted_entries:
+                pub = _normalize_value(e.get("publisher", ""))
+                cur = _normalize_value(e.get("apc_currency", ""))
+                val = _normalize_value(e.get("apc_value", ""))
+                parts.append(f"{pub}:{cur}:{val}")
+            return "|".join(parts)
+
+        def _compute_apc_mode_aggregate(apc_entries: List[dict]) -> str:
+            """Compute deterministic aggregate string of APC modes for hashing."""
+            if not apc_entries:
+                return ""
+            modes = sorted(set(
+                _normalize_value(e.get("apc_mode_normalized", e.get("mode_raw", "")))
+                for e in apc_entries
+                if _normalize_value(e.get("apc_mode_normalized", e.get("mode_raw", "")))
+            ))
+            return "|".join(modes)
 
         # ----------------------------------------------------------------
         # PHASE 2: In-memory classify + hash compare + field diff (0 queries)
@@ -555,6 +630,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
         to_insert_scopus = []     # etc.
         to_insert_mjl = []
         to_insert_scimago = []
+        to_upsert_apc = []        # apc rows to upsert (new + updated journals)
         to_update_journals = []   # updated journal rows (with id)
         to_update_cfr = []
         to_update_scopus = []
@@ -571,6 +647,20 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
 
             # Compute new hash
             _mjl_match_for_hash = "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped", "no data") else "Print ISSN" if rec["MJL Matched ISSN"] not in ("no data", "skipped", "") else "No Match"
+
+            # Compute APC aggregates for hash
+            _apc_val = rec.get("APC Value", "no data")
+            _apc_cur = rec.get("APC Currency", "no data")
+            _apc_mode = rec.get("APC Mode", "no data")
+            _apc_for_hash = ""
+            _apc_mode_for_hash = ""
+            if _apc_val not in ("no data", "", "N/A"):
+                # Use APC lookup's publisher (not CFR publisher) to match _compute_apc_aggregate
+                _apc_entry = apc_lookup.get(rec["Sl.No"])
+                _apc_pub = _apc_entry.get("publisher", "") if _apc_entry else ""
+                _apc_for_hash = f"{_normalize_value(_apc_pub)}:{_normalize_value(_apc_cur)}:{_normalize_value(_apc_val)}"
+                _apc_mode_for_hash = _normalize_value(_apc_mode) if _apc_mode not in ("no data", "", "N/A") else ""
+
             hash_input = build_hash_input(
                 journal_title=rec["Full Journal Title"],
                 print_issn=rec["Print-ISSN"],
@@ -601,6 +691,8 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                 h_index=rec["H-Index"],
                 scimago_coverage=rec["SCImago Coverage"],
                 scimago_url=rec["SCImago URL"],
+                apc_aggregate=_apc_for_hash,
+                apc_mode_aggregate=_apc_mode_for_hash,
             )
             new_hash = compute_data_hash(hash_input)
 
@@ -678,6 +770,20 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                 to_insert_scopus.append(scopus_row)
                 to_insert_mjl.append(mjl_row)
                 to_insert_scimago.append(scimago_row)
+                # Collect APC rows (1:many - could be multiple publishers)
+                _apc_entries = apc_lookup.get(rec["Sl.No"], [])
+                if _apc_entries:
+                    _apc_list = [_apc_entries] if isinstance(_apc_entries, dict) else _apc_entries
+                    for _apc_e in _apc_list:
+                        to_upsert_apc.append({
+                            "journal_id": "",  # filled after bulk insert
+                            "publisher": _apc_e.get("publisher", ""),
+                            "apc_value": _apc_e.get("apc_value", ""),
+                            "apc_currency": _apc_e.get("apc_currency", ""),
+                            "apc_mode_raw": _apc_e.get("mode_raw", ""),
+                            "apc_mode_normalized": _apc_e.get("mode_normalized", ""),
+                            "source_file": "bulk",
+                        })
                 # Track for duplicate ISSN within same run
                 for norm in (norm_p, norm_e):
                     if norm and norm != "no data":
@@ -690,6 +796,9 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                 old_scopus = scopus_map.get(jid, {})
                 old_mjl = mjl_map.get(jid, {})
                 old_scimago = scimago_map.get(jid, {})
+                old_apc = apc_map.get(jid, [])
+                old_apc_aggregate = _compute_apc_aggregate(old_apc)
+                old_apc_mode_aggregate = _compute_apc_mode_aggregate(old_apc)
                 old_hash_input = build_hash_input(
                     journal_title=existing.get("title", ""),
                     print_issn=existing.get("print_issn", ""),
@@ -720,6 +829,8 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                     h_index=old_scimago.get("h_index", ""),
                     scimago_coverage=old_scimago.get("coverage", ""),
                     scimago_url=old_scimago.get("url", ""),
+                    apc_aggregate=old_apc_aggregate,
+                    apc_mode_aggregate=old_apc_mode_aggregate,
                 )
                 old_hash_computed = compute_data_hash(old_hash_input)
 
@@ -777,6 +888,20 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                     to_update_mjl.append(mjl_row)
                     scimago_row["journal_id"] = jid
                     to_update_scimago.append(scimago_row)
+                    # Collect APC for upsert (1:many)
+                    _apc_entries = apc_lookup.get(rec["Sl.No"], [])
+                    if _apc_entries:
+                        _apc_list = [_apc_entries] if isinstance(_apc_entries, dict) else _apc_entries
+                        for _apc_e in _apc_list:
+                            to_upsert_apc.append({
+                                "journal_id": jid,
+                                "publisher": _apc_e.get("publisher", ""),
+                                "apc_value": _apc_e.get("apc_value", ""),
+                                "apc_currency": _apc_e.get("apc_currency", ""),
+                                "apc_mode_raw": _apc_e.get("mode_raw", ""),
+                                "apc_mode_normalized": _apc_e.get("mode_normalized", ""),
+                                "source_file": "bulk",
+                            })
                     for src, fld, old_v, new_v in changes:
                         all_changes.append({
                             "journal_id": jid,
@@ -792,7 +917,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
         print(f"[INFO] DB PHASE 2: Classified {db_stats['new_records']} new | {db_stats['updated_records']} updated | {db_stats['unchanged_records']} unchanged in {phase2_time:.3f}s (0 queries)", flush=True)
 
         # ----------------------------------------------------------------
-        # PHASE 3: Bulk WRITE (9 queries total, not 500+)
+        # PHASE 3: Bulk WRITE (queries total, not 500+)
         # ----------------------------------------------------------------
         print(f"[INFO] DB PHASE 3: Bulk writing to Supabase...", flush=True)
         phase3_start = time.perf_counter()
@@ -824,23 +949,34 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
         bulk_upsert_child("mjl_results", to_insert_mjl)
         bulk_upsert_child("scimago_results", to_insert_scimago)
 
-        # 6. Bulk update CHANGED journals
+        # 6. Bulk upsert APC rows for NEW journals (assign journal_id from new_ids)
+        if to_upsert_apc:
+            apc_idx = 0
+            for i, jid in enumerate(new_ids):
+                _sl_no = to_insert_cfr[i].get("sl_no", "")
+                _has_apc = _sl_no in apc_lookup
+                if _has_apc and apc_idx < len(to_upsert_apc):
+                    to_upsert_apc[apc_idx]["journal_id"] = jid
+                    apc_idx += 1
+            bulk_upsert_apc(to_upsert_apc)
+
+        # 7. Bulk update CHANGED journals
         if to_update_journals:
             print(f"  [WRITE] Updating {len(to_update_journals)} changed journals...", flush=True)
             bulk_update_journals(to_update_journals)
 
-        # 7-10. Bulk upsert child tables for CHANGED journals
+        # 8-11. Bulk upsert child tables for CHANGED journals
         bulk_upsert_child("cfr_results", to_update_cfr)
         bulk_upsert_child("scopus_results", to_update_scopus)
         bulk_upsert_child("mjl_results", to_update_mjl)
         bulk_upsert_child("scimago_results", to_update_scimago)
 
-        # 11. Bulk touch UNCHANGED journals (1 query)
+        # 13. Bulk touch UNCHANGED journals (1 query)
         if to_touch_ids:
             print(f"  [WRITE] Touching {len(to_touch_ids)} unchanged journals...", flush=True)
             bulk_touch_journals(to_touch_ids, pipeline_run_id or "")
 
-        # 12. Bulk insert CHANGES
+        # 14. Bulk insert CHANGES
         if all_changes:
             print(f"  [WRITE] Inserting {len(all_changes)} change records...", flush=True)
             bulk_insert_changes(all_changes)
@@ -886,6 +1022,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"  Scopus Not Indexed        : {scopus_stats['not_indexed']}")
     print(f"  Scopus Unable to Verify   : {scopus_stats['unable_to_verify']}")
     print()
+    print(f"APC Verification (Active)   : {len(eligible_pairs)}")
+    print(f"  APC Found                 : {apc_found_count}")
+    print(f"  APC Not Found             : {apc_not_found}")
+    print()
     print(f"MJL Verification (Active)   : {len(eligible_pairs)}")
     print(f"  MJL Found                 : {mjl_found}")
     print(f"  MJL Not Found             : {mjl_not_found}")
@@ -906,6 +1046,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"CFR collection time         : {cfr_duration:.2f} sec")
     print(f"Scopus initialization       : {scopus_init_time:.2f} sec")
     print(f"Scopus verification         : {scopus_verify_time:.4f} sec")
+    print(f"APC stage time              : {apc_duration:.2f} sec")
     print(f"MJL stage time              : {mjl_duration:.2f} sec")
     print(f"SCImago stage time          : {scimago_duration:.2f} sec")
     if use_db:

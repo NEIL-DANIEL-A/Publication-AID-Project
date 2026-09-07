@@ -4,7 +4,7 @@ Single place to change any external endpoint.
 """
 
 # CFR Anna University
-CFR_START_URL = "https://cfr.annauniv.edu/research/academics/english-journals-list.php"
+CFR_START_URL = "https://cfr.annauniv.edu/research/academics/journals-list.php"
 
 # Scopus - Elsevier Source Title List
 ELSEVIER_SCOPUS_POLICY_URL = "https://www.elsevier.com/solutions/scopus/how-scopus-works/content/content-policy-and-selection"
@@ -20,6 +20,9 @@ MJL_HOME_URL = "https://mjl.clarivate.com/search-results"
 # SCImago
 SCIMAGO_SEARCH_BASE = "https://www.scimagojr.com/journalsearch.php?q={issn}"
 SCIMAGO_JOURNAL_BASE = "https://www.scimagojr.com/journalsearch.php?q={journal_id}&tip=sid&clean=0"
+
+# APC (Article Processing Charge)
+APC_CACHE_DIR = "apc_cache"
 
 # Output
 OUTPUT_DIR_NAME = "output"

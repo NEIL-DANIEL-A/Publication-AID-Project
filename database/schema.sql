@@ -183,6 +183,31 @@ CREATE INDEX IF NOT EXISTS skipped_records_pipeline_run_id_idx ON skipped_record
 CREATE INDEX IF NOT EXISTS skipped_records_print_issn_idx ON skipped_records(normalized_print);
 CREATE INDEX IF NOT EXISTS skipped_records_e_issn_idx ON skipped_records(normalized_e);
 
+-- ===================================================================
+-- APC RESULTS (one-to-many: 1 journal can have multiple publisher APCs)
+-- ===================================================================
+CREATE TABLE IF NOT EXISTS apc_results (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    journal_id UUID NOT NULL REFERENCES journals(id) ON DELETE CASCADE,
+    publisher TEXT NOT NULL,           -- 'Wiley', 'Elsevier', 'Springer Nature'
+    apc_value TEXT,                    -- raw string from file (e.g. '3500', '2950')
+    apc_currency TEXT,                 -- 'USD', 'EUR', 'GBP', 'JPY'
+    apc_mode_raw TEXT,                 -- raw OA mode from file (e.g. 'Gold', 'Hybrid')
+    apc_mode_normalized TEXT,          -- lowercased + stripped version of apc_mode_raw
+    source_file TEXT,                  -- which file this came from (for audit)
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS apc_results_journal_id_idx ON apc_results(journal_id);
+CREATE INDEX IF NOT EXISTS apc_results_publisher_idx ON apc_results(publisher);
+CREATE INDEX IF NOT EXISTS apc_results_mode_normalized_idx ON apc_results(apc_mode_normalized);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name='apc_results_journal_publisher_uniq') THEN
+    ALTER TABLE apc_results ADD CONSTRAINT apc_results_journal_publisher_uniq UNIQUE (journal_id, publisher);
+  END IF;
+END $$;
+DROP TRIGGER IF EXISTS apc_results_updated_at ON apc_results;
+CREATE TRIGGER apc_results_updated_at BEFORE UPDATE ON apc_results FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
 -- Add FK for journals.last_seen_pipeline_run_id after pipeline_runs exists
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name='journals_last_seen_run_fk') THEN

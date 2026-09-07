@@ -73,6 +73,8 @@ def build_hash_input(
     h_index: str = "",
     scimago_coverage: str = "",
     scimago_url: str = "",
+    apc_aggregate: str = "",
+    apc_mode_aggregate: str = "",
 ) -> dict:
     """Helper to build consistent dict for hashing from ALL extracted fields (except volatile execution_time/error). Any extracted field change will be detected."""
     return {
@@ -105,4 +107,6 @@ def build_hash_input(
         "h_index": h_index,
         "scimago_coverage": scimago_coverage,
         "scimago_url": scimago_url,
+        "apc_aggregate": apc_aggregate,
+        "apc_mode_aggregate": apc_mode_aggregate,
     }

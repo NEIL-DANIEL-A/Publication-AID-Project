@@ -412,3 +412,43 @@ def bulk_insert_changes(changes: List[dict]):
     for i in range(0, len(changes), BATCH_SIZE):
         chunk = changes[i:i + BATCH_SIZE]
         client.table("journal_changes").insert(chunk).execute()
+
+
+# ------------------------------------------------------------------ #
+# APC RESULTS (one-to-many)
+# ------------------------------------------------------------------ #
+def bulk_get_apc_map(journal_ids: List[str]) -> Dict[str, List[dict]]:
+    """
+    Bulk fetch all APC rows for given journal_ids.
+    Returns dict: journal_id -> list of apc row dicts (1:many).
+    1 query.
+    """
+    if not journal_ids:
+        return {}
+    client = get_supabase_client()
+    CHUNK = 500
+    result: Dict[str, List[dict]] = {}
+    for i in range(0, len(journal_ids), CHUNK):
+        chunk = journal_ids[i:i + CHUNK]
+        res = client.table("apc_results").select("*").in_("journal_id", chunk).execute()
+        for row in (res.data or []):
+            jid = row.get("journal_id")
+            if jid:
+                if jid not in result:
+                    result[jid] = []
+                result[jid].append(row)
+    return result
+
+
+def bulk_upsert_apc(rows: List[dict]):
+    """
+    Upsert apc_results rows (insert or update on conflict).
+    Uses UNIQUE(journal_id, publisher) constraint.
+    Chunked to avoid payload limits.
+    """
+    if not rows:
+        return
+    client = get_supabase_client()
+    for i in range(0, len(rows), BATCH_SIZE):
+        chunk = rows[i:i + BATCH_SIZE]
+        client.table("apc_results").upsert(chunk, on_conflict="journal_id,publisher").execute()
