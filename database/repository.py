@@ -67,21 +67,27 @@ def get_all_journals_map() -> Dict[str, dict]:
     """
     Bulk fetch all journals for fast in-memory lookup.
     Returns dict with keys: normalized_print and normalized_e -> journal row.
-    Single query instead of 500+ per-journal queries (were ~100s for 257 journals).
+    Handles Supabase pagination (default 1000 rows per page).
     """
     client = get_supabase_client()
-    res = client.table("journals").select("id, title, print_issn, e_issn, normalized_print, normalized_e, data_hash, publisher, country").execute()
-    rows = res.data or []
+    all_rows = []
+    offset = 0
+    page_size = 1000
+    while True:
+        res = client.table("journals").select("id, title, print_issn, e_issn, normalized_print, normalized_e, data_hash, publisher, country").range(offset, offset + page_size - 1).execute()
+        rows = res.data or []
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
     lookup: Dict[str, dict] = {}
-    for row in rows:
+    for row in all_rows:
         np = row.get("normalized_print")
         ne = row.get("normalized_e")
         if np and np != "no data":
             lookup[np] = row
-            # Also allow cross lookup: same row accessible via both keys
         if ne and ne != "no data":
             lookup[ne] = row
-        # Also handle cross: if journal has both, both keys point to same row
     return lookup
 
 
