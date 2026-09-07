@@ -153,16 +153,6 @@ def run_excel_batch(input_path: str):
     total_batch_minutes = round(total_batch_time / 60.0, 2)
     average_time = round(sum(individual_times) / total_count, 2) if total_count > 0 else 0.0
 
-    out_df = pd.DataFrame(results)
-    out_path = os.path.join(OUTPUT_DIR, "scimago_results.xlsx")
-    try:
-        out_df.to_excel(out_path, index=False)
-        saved_file = out_path
-    except PermissionError:
-        alt_path = os.path.join(OUTPUT_DIR, "scimago_results_latest.xlsx")
-        out_df.to_excel(alt_path, index=False)
-        saved_file = alt_path
-
     # Print Batch Summary
     print("\n========================================")
     print("SCIMAGO BATCH SUMMARY")
@@ -181,7 +171,7 @@ def run_excel_batch(input_path: str):
     print(f"  500 ISSNs  ~ {(500 * average_time / 60.0):.1f} minutes")
     print(f"  1000 ISSNs ~ {(1000 * average_time / 60.0):.1f} minutes")
     print("========================================\n")
-    print(f"[SUCCESS] Results saved to {saved_file}")
+    print(f"[SUCCESS] Batch complete ({total_count} ISSNs, {total_batch_time:.2f}s)")
 
 
 def report_duplicates(journals: List[CFRJournal]):
@@ -200,8 +190,7 @@ def report_duplicates(journals: List[CFRJournal]):
 
 
 def run_source_only():
-    """Scrape CFR website and export CFR records to output/cfr_journals.xlsx."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    """Scrape CFR website and print CFR records."""
     print("[INFO] Starting CFR Data Collection (Source-Only Mode)...")
 
     cfr_start = time.perf_counter()
@@ -210,29 +199,7 @@ def run_source_only():
 
     print(f"[TIME] CFR collection duration: {cfr_duration:.2f} seconds")
     report_duplicates(journals)
-
-    rows = []
-    for j in journals:
-        rows.append({
-            "Sl.No": j.sl_no,
-            "Full Journal Title": j.journal_title,
-            "Print-ISSN": j.print_issn,
-            "E-ISSN": j.e_issn,
-            "Publisher": j.publisher,
-            "Country": j.country,
-        })
-
-    out_df = pd.DataFrame(rows)
-    out_path = os.path.join(OUTPUT_DIR, "cfr_journals.xlsx")
-    try:
-        out_df.to_excel(out_path, index=False)
-        saved_file = out_path
-    except PermissionError:
-        alt_path = os.path.join(OUTPUT_DIR, "cfr_journals_latest.xlsx")
-        out_df.to_excel(alt_path, index=False)
-        saved_file = alt_path
-
-    print(f"[SUCCESS] CFR journals saved to {saved_file} ({len(journals)} records)")
+    print(f"[SUCCESS] CFR journals collected ({len(journals)} records)")
     return journals
 
 
@@ -908,18 +875,6 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
 
     total_pipeline_time = round(time.perf_counter() - pipeline_start, 2)
 
-    # Write output to Excel (legacy, optional)
-    # Excel is no longer source of truth; kept for debug if needed
-    out_df = pd.DataFrame(results)
-    out_path = os.path.join(OUTPUT_DIR, "cfr_scopus_mjl_scimago_results.xlsx")
-    try:
-        out_df.to_excel(out_path, index=False)
-        saved_file = out_path
-    except PermissionError:
-        alt_path = os.path.join(OUTPUT_DIR, "cfr_scopus_mjl_scimago_results_latest.xlsx")
-        out_df.to_excel(alt_path, index=False)
-        saved_file = alt_path
-
     # Print Final Pipeline Execution Summary
     print("\n========================================")
     print("COMPLETE PIPELINE EXECUTION SUMMARY")
@@ -959,7 +914,6 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print("========================================\n")
     if use_db and pipeline_run_id:
         print(f"[SUCCESS] Pipeline run {pipeline_run_id} persisted to Supabase")
-    print(f"[SUCCESS] Consolidated results saved to {saved_file} (legacy Excel)")
 
 
 def main():
