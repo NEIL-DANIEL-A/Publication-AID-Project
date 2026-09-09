@@ -54,10 +54,14 @@ def _download_file(url: str, dest_path: str, timeout: int = 60) -> bool:
         return False
 
 
-def _parse_wiley_xlsx(filepath: str, issn_col: str, apc_col: str, mode_col: str, publisher_label: str, header_row: int = 0) -> List[dict]:
+def _parse_wiley_xlsx(filepath: str, issn_col: str, apc_col: str, mode_col: str, publisher_label: str, header_row: int = 0, mode_label: str = "") -> List[dict]:
     """
     Parse Wiley Open Access Excel. Returns list of dicts:
     [{"issn": "1234-5678", "apc_usd": "3500", "mode": "Gold", "publisher": "Wiley"}, ...]
+
+    If mode_label is provided (non-empty), it is used for all rows instead of
+    reading mode from the spreadsheet column. This mirrors the SAGE approach
+    where the mode is determined by which download link the file comes from.
     """
     results = []
     try:
@@ -68,7 +72,7 @@ def _parse_wiley_xlsx(filepath: str, issn_col: str, apc_col: str, mode_col: str,
 
     issn_found = _find_column(df, "issn", issn_col)
     apc_found = _find_column(df, "apc_usd", apc_col)
-    mode_found = _find_column(df, "mode", mode_col)
+    mode_found = _find_column(df, "mode", mode_col) if not mode_label else ""
 
     if not issn_found or issn_found not in df.columns:
         logger.warning(f"Wiley xlsx: ISSN column not found. Available: {list(df.columns)}")
@@ -80,7 +84,10 @@ def _parse_wiley_xlsx(filepath: str, issn_col: str, apc_col: str, mode_col: str,
         if norm == "no data" or not norm:
             continue
         apc_val = str(row.get(apc_found, "")).strip() if apc_found and apc_found in df.columns else ""
-        mode_val = str(row.get(mode_found, "")).strip() if mode_found and mode_found in df.columns else ""
+        if mode_label:
+            mode_val = mode_label
+        else:
+            mode_val = str(row.get(mode_found, "")).strip() if mode_found and mode_found in df.columns else ""
         if apc_val and apc_val.lower() not in ("", "n/a", "na", "none", "varies", "contact"):
             results.append({
                 "issn": norm,
@@ -287,11 +294,15 @@ def _parse_sage_gold_oa_xlsx(filepath: str, title_col: str, apc_col: str, curren
     return results
 
 
-def _parse_springer_pdf(filepath: str) -> List[dict]:
+def _parse_springer_pdf(filepath: str, mode_label: str = "") -> List[dict]:
     """
     Parse Springer Nature APC PDF via pdfplumber.
     Extracts table rows with ISSN, APC (EUR/USD/GBP), and OA mode.
     Returns list of dicts.
+
+    If mode_label is provided (non-empty), it is used for all rows instead of
+    reading mode from the PDF table column. This mirrors the SAGE approach
+    where the mode is determined by which download link the file comes from.
     """
     results = []
     try:
@@ -352,7 +363,9 @@ def _parse_springer_pdf(filepath: str) -> List[dict]:
                                     break
 
                         mode_val = ""
-                        if mode_idx is not None and mode_idx < len(row):
+                        if mode_label:
+                            mode_val = mode_label
+                        elif mode_idx is not None and mode_idx < len(row):
                             mode_val = str(row[mode_idx] or "").strip()
 
                         if apc_val:
@@ -518,7 +531,7 @@ class APCVerifier:
             return []
 
         if "Wiley" in src["name"]:
-            return _parse_wiley_xlsx(dest, src["issn_col"], src["apc_col"], src["mode_col"], "Wiley", header_row)
+            return _parse_wiley_xlsx(dest, src["issn_col"], src["apc_col"], src["mode_col"], "Wiley", header_row, mode_label=src.get("mode_label", ""))
         elif "Elsevier" in src["name"]:
             return _parse_elsevier_xlsx(dest, src["issn_col"], src["apc_col"], src["mode_col"], header_row)
         elif "OUP" in src["name"]:
@@ -552,7 +565,7 @@ class APCVerifier:
             else:
                 return []
 
-        return _parse_springer_pdf(dest)
+        return _parse_springer_pdf(dest, mode_label=src.get("mode_label", ""))
 
     def lookup(self, issn: str) -> Optional[dict]:
         """

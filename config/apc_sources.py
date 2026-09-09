@@ -14,6 +14,7 @@ APC_SOURCES = {
             "issn_col": "Online ISSN",
             "apc_col": "USD",
             "mode_col": "",
+            "mode_label": "Open Access",
         },
         {
             "name": "Wiley Hybrid",
@@ -24,6 +25,7 @@ APC_SOURCES = {
             "issn_col": "Online\nISSN",
             "apc_col": "USD $",
             "mode_col": "",
+            "mode_label": "Hybrid",
         },
     ],
     "Elsevier": [
@@ -88,6 +90,7 @@ APC_SOURCES = {
             "apc_col_usd": "USD",
             "apc_col_gbp": "GBP",
             "mode_col": "Type",
+            "mode_label": "Hybrid",
         },
         {
             "name": "Springer Nature Fully OA",
@@ -99,6 +102,7 @@ APC_SOURCES = {
             "apc_col_usd": "USD",
             "apc_col_gbp": "GBP",
             "mode_col": "Type",
+            "mode_label": "Fully OA",
         },
     ],
 }
