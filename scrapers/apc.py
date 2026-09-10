@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from config.apc_sources import APC_SOURCES, APC_COLUMN_ALIASES
+from config.urls import ELSEVIER_GPOA_URL
 from processors.issn import normalize_issn
 
 logger = logging.getLogger(__name__)
@@ -382,6 +383,120 @@ def _parse_springer_pdf(filepath: str, mode_label: str = "") -> List[dict]:
     return results
 
 
+def _fetch_elsevier_gpoa_issns() -> set:
+    """
+    Fetch Elsevier GPOA (Geographical Pricing for Open Access) pilot list.
+    Page: https://www.elsevier.com/about/policies-and-standards/pricing/gpoa-journals-list
+    Contains | Journal Title | ISSN |  — ~300 rows with 20% off.
+    Returns set of normalized ISSNs (no hyphen, e.g. 00016918).
+    Caches to apc_cache/Elsevier_GPOA.json for offline use.
+    """
+    cache_path = os.path.join(APC_CACHE_DIR, "Elsevier_GPOA.json")
+    gpoa_set = set()
+    # Try live fetch
+    try:
+        req = urllib.request.Request(ELSEVIER_GPOA_URL, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        # Parse ISSN column from markdown/HTML table — ISSN pattern XXXX-XXXX (last char may be X)
+        # Extract all ISSNs from table rows
+        issn_pattern = re.compile(r"\b\d{4}-\d{3}[\dxX]\b")
+        for m in issn_pattern.finditer(html):
+            raw = m.group(0)
+            norm = normalize_issn(raw)
+            if norm != "no data":
+                gpoa_set.add(norm)
+        if gpoa_set:
+            try:
+                os.makedirs(APC_CACHE_DIR, exist_ok=True)
+                import json as _json
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    _json.dump(sorted(gpoa_set), f, indent=2)
+            except Exception:
+                pass
+            logger.info(f"Elsevier GPOA: fetched {len(gpoa_set)} ISSNs live")
+            return gpoa_set
+    except Exception as e:
+        logger.warning(f"Elsevier GPOA live fetch failed: {e}")
+
+    # Fallback to cache
+    try:
+        if os.path.exists(cache_path):
+            import json as _json
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            gpoa_set = set(data)
+            logger.info(f"Elsevier GPOA: loaded {len(gpoa_set)} ISSNs from cache")
+    except Exception as e:
+        logger.warning(f"Elsevier GPOA cache load failed: {e}")
+    return gpoa_set
+
+
+def _calc_gpoa_discount(apc_value: str, percent: int = 20) -> tuple:
+    """
+    Calculate discounted APC: 20% off original.
+    Handles strings like "3500", "$3,500.00", "3 500", "3500.00"
+    Returns (original_clean, discounted_str) or (original, None) if not numeric.
+    """
+    if not apc_value or apc_value.lower() in ("", "n/a", "na", "none", "varies", "contact"):
+        return apc_value, None
+    # Extract numeric value
+    cleaned = apc_value.strip().replace(",", "").replace(" ", "")
+    # Remove currency symbols
+    num_match = re.search(r"(\d+(?:\.\d+)?)", cleaned)
+    if not num_match:
+        return apc_value, None
+    try:
+        original_num = float(num_match.group(1))
+        discounted_num = round(original_num * (100 - percent) / 100)
+        # Preserve formatting: if original had decimals, keep .00? For now return int-string
+        # If original was like "3500.00", return "2800"
+        if discounted_num == int(discounted_num):
+            discounted_str = str(int(discounted_num))
+        else:
+            discounted_str = f"{discounted_num:.2f}"
+        return apc_value.strip(), discounted_str
+    except Exception:
+        return apc_value, None
+
+
+def _apply_gpoa_discount(records: List[dict], gpoa_issns: set, percent: int = 20) -> List[dict]:
+    """
+    Annotate Elsevier records that are in GPOA list:
+      has_gpoa_discount, original_apc_value, discounted_apc_value,
+      discount_percent, is_highlighted, apc_value becomes discounted for display,
+      while original kept for strikethrough.
+    Card should be highlighted by default when has_gpoa_discount is true.
+    """
+    if not gpoa_issns:
+        return records
+    for rec in records:
+        if rec.get("publisher") != "Elsevier":
+            continue
+        norm = rec.get("issn", "")
+        if norm in gpoa_issns:
+            orig, discounted = _calc_gpoa_discount(rec.get("apc_value", ""), percent)
+            if discounted:
+                rec["has_gpoa_discount"] = True
+                rec["original_apc_value"] = orig
+                rec["discounted_apc_value"] = discounted
+                rec["discount_percent"] = percent
+                rec["is_highlighted"] = True
+                # Keep apc_value as discounted for downstream lookup/display
+                # Original is preserved for strikethrough
+                rec["apc_value"] = discounted
+            else:
+                rec["has_gpoa_discount"] = False
+                rec["is_highlighted"] = False
+        else:
+            rec["has_gpoa_discount"] = False
+            rec["is_highlighted"] = False
+            rec["discount_percent"] = 0
+    return records
+
+
 def _normalize_mode(mode_raw: str) -> str:
     """Normalize OA mode to lowercase + strip."""
     if not mode_raw:
@@ -394,7 +509,7 @@ def _build_issn_map(records: List[dict]) -> Dict[str, List[dict]]:
     Build ISSN -> list of APC records, deduplicated per (issn, publisher).
     If the same ISSN appears multiple times from the same publisher (e.g. different
     license modes in Wiley OA + Hybrid files), keep only the first occurrence.
-    Returns dict: normalized_issn -> [{"apc_value", "apc_currency", "mode_raw", "publisher", "mode_normalized"}, ...]
+    Returns dict: normalized_issn -> [{"apc_value", "apc_currency", "mode_raw", "publisher", "mode_normalized", "has_gpoa_discount", "original_apc_value", "discounted_apc_value", "is_highlighted"}, ...]
     """
     issn_map: Dict[str, List[dict]] = {}
     seen_publishers: Dict[str, set] = {}  # issn -> set of publishers already added
@@ -407,6 +522,12 @@ def _build_issn_map(records: List[dict]) -> Dict[str, List[dict]]:
             "mode_raw": rec.get("mode_raw", ""),
             "mode_normalized": _normalize_mode(rec.get("mode_raw", "")),
             "publisher": publisher,
+            # GPOA discount (Elsevier 20% off) — for strikethrough + highlighted card
+            "has_gpoa_discount": rec.get("has_gpoa_discount", False),
+            "original_apc_value": rec.get("original_apc_value", rec.get("apc_value", "")),
+            "discounted_apc_value": rec.get("discounted_apc_value", rec.get("apc_value", "")),
+            "discount_percent": rec.get("discount_percent", 0),
+            "is_highlighted": rec.get("is_highlighted", False),
         }
         if issn not in issn_map:
             issn_map[issn] = []
@@ -460,6 +581,7 @@ class APCVerifier:
             "wiley_oa_count": 0,
             "wiley_hybrid_count": 0,
             "elsevier_count": 0,
+            "elsevier_gpoa_count": 0,
             "springer_count": 0,
             "oup_count": 0,
             "sage_count": 0,
@@ -467,6 +589,7 @@ class APCVerifier:
             "load_time": 0.0,
         }
         self._loaded = False
+        self.gpoa_issns: set = set()
 
     def load_all(self) -> None:
         """Download and parse all publisher APC files. Builds unified ISSN map."""
@@ -499,6 +622,14 @@ class APCVerifier:
 
                 all_records.extend(records)
                 print(f"{len(records)} journals")
+
+        # Fetch Elsevier GPOA list (20% off pilot) and annotate Elsevier records
+        print(f"  [APC] Loading Elsevier GPOA (20% off)...", end=" ", flush=True)
+        self.gpoa_issns = _fetch_elsevier_gpoa_issns()
+        all_records = _apply_gpoa_discount(all_records, self.gpoa_issns, percent=20)
+        gpoa_hits = sum(1 for r in all_records if r.get("has_gpoa_discount"))
+        self.stats["elsevier_gpoa_count"] = gpoa_hits
+        print(f"{len(self.gpoa_issns)} ISSNs in pilot, {gpoa_hits} matched")
 
         # Separate records with ISSN (for issn_map) and without ISSN but with title (for title_map)
         issn_records = [r for r in all_records if r.get("issn")]

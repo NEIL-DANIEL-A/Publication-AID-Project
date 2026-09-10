@@ -205,6 +205,33 @@ DO $$ BEGIN
     ALTER TABLE apc_results ADD CONSTRAINT apc_results_journal_publisher_uniq UNIQUE (journal_id, publisher);
   END IF;
 END $$;
+-- GPOA discount columns (Elsevier geographical pricing 20% off)
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='apc_results' AND column_name='has_gpoa_discount') THEN
+    ALTER TABLE apc_results ADD COLUMN has_gpoa_discount BOOLEAN NOT NULL DEFAULT false;
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='apc_results' AND column_name='original_apc_value') THEN
+    ALTER TABLE apc_results ADD COLUMN original_apc_value TEXT;
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='apc_results' AND column_name='discounted_apc_value') THEN
+    ALTER TABLE apc_results ADD COLUMN discounted_apc_value TEXT;
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='apc_results' AND column_name='discount_percent') THEN
+    ALTER TABLE apc_results ADD COLUMN discount_percent INT;
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='apc_results' AND column_name='is_highlighted') THEN
+    ALTER TABLE apc_results ADD COLUMN is_highlighted BOOLEAN NOT NULL DEFAULT false;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS apc_results_gpoa_idx ON apc_results(has_gpoa_discount) WHERE has_gpoa_discount = true;
 DROP TRIGGER IF EXISTS apc_results_updated_at ON apc_results;
 CREATE TRIGGER apc_results_updated_at BEFORE UPDATE ON apc_results FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
@@ -221,3 +248,5 @@ DO $$ BEGIN
     ALTER TABLE pipeline_runs ADD COLUMN duplicate_skipped INT DEFAULT 0;
   END IF;
 END $$;
+
+-- Validation & Approval Layer is in schema_validation.sql — run it separately after this file

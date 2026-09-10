@@ -23,12 +23,12 @@ jobs:
           scrapling install
           playwright install chromium --with-deps
 
-      - name: Run Publication-AID pipeline
+      - name: Run Publication-AID pipeline (validation mode — no direct production write)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
-          python main.py --workers 5
+          python main.py --workers 5 --validate
 
       - name: Upload legacy Excel artifact (debug)
         if: always()
