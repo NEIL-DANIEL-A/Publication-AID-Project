@@ -23,6 +23,7 @@ SCIMAGO_JOURNAL_BASE = "https://www.scimagojr.com/journalsearch.php?q={journal_i
 
 # APC (Article Processing Charge)
 APC_CACHE_DIR = "apc_cache"
+ELSEVIER_GPOA_URL = "https://www.elsevier.com/about/policies-and-standards/pricing/gpoa-journals-list"
 
 # Output
 OUTPUT_DIR_NAME = "output"
