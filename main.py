@@ -675,10 +675,17 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 _apc_for_hash = f"{_normalize_value(_apc_pub)}:{_normalize_value(_apc_cur)}:{_normalize_value(_apc_val)}"
                 _apc_mode_for_hash = _normalize_value(_apc_mode) if _apc_mode not in ("no data", "", "N/A") else ""
 
+            # Normalize ISSN for hashing so hyphen variations don't create false changes; use _n2 helper
+            _hash_print = _n2(rec["Print-ISSN"])
+            _hash_e = _n2(rec["E-ISSN"])
+            if _hash_print == "no data":
+                _hash_print = ""
+            if _hash_e == "no data":
+                _hash_e = ""
             hash_input = build_hash_input(
                 journal_title=rec["Full Journal Title"],
-                print_issn=rec["Print-ISSN"],
-                e_issn=rec["E-ISSN"],
+                print_issn=_hash_print,
+                e_issn=_hash_e,
                 publisher=rec["Publisher"],
                 country=rec["Country"],
                 cfr_sl_no=rec["Sl.No"],
@@ -688,10 +695,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 scopus_sourcerecord_id=rec["Scopus Source Record ID"],
                 scopus_publisher=rec["Scopus Publisher"],
                 scopus_coverage=rec["Scopus Coverage"],
-                scopus_issn="",
-                scopus_eissn="",
-                scopus_raw_active="",
-                scopus_raw_discontinued="",
+                scopus_issn=rec.get("Scopus ISSN", ""),
+                scopus_eissn=rec.get("Scopus EISSN", ""),
+                scopus_raw_active=rec.get("Scopus Raw Active", ""),
+                scopus_raw_discontinued=rec.get("Scopus Raw Discontinued", ""),
                 mjl_status=rec["MJL Status"],
                 mjl_index=rec["MJL Index"],
                 mjl_issn_used=rec["MJL Matched ISSN"],
@@ -738,10 +745,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 "source_title": rec["Scopus Source Title"],
                 "scopus_publisher": rec["Scopus Publisher"],
                 "scopus_coverage": rec["Scopus Coverage"],
-                "scopus_issn": "",
-                "scopus_eissn": "",
-                "raw_active_status": "",
-                "raw_discontinued_flag": "",
+                "scopus_issn": rec.get("Scopus ISSN", ""),
+                "scopus_eissn": rec.get("Scopus EISSN", ""),
+                "raw_active_status": rec.get("Scopus Raw Active", ""),
+                "raw_discontinued_flag": rec.get("Scopus Raw Discontinued", ""),
             }
             mjl_exec = rec.get("MJL Execution Time (sec)", "no data")
             try:
@@ -818,10 +825,17 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 old_apc = apc_map.get(jid, [])
                 old_apc_aggregate = _compute_apc_aggregate(old_apc)
                 old_apc_mode_aggregate = _compute_apc_mode_aggregate(old_apc)
+                # Normalize ISSN for old hash as well to match new hash normalization
+                _old_hash_print = _n2(existing.get("print_issn", ""))
+                _old_hash_e = _n2(existing.get("e_issn", ""))
+                if _old_hash_print == "no data":
+                    _old_hash_print = ""
+                if _old_hash_e == "no data":
+                    _old_hash_e = ""
                 old_hash_input = build_hash_input(
                     journal_title=existing.get("title", ""),
-                    print_issn=existing.get("print_issn", ""),
-                    e_issn=existing.get("e_issn", ""),
+                    print_issn=_old_hash_print,
+                    e_issn=_old_hash_e,
                     publisher=existing.get("publisher", ""),
                     country=existing.get("country", ""),
                     cfr_sl_no=old_cfr.get("sl_no", ""),
@@ -860,13 +874,24 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 else:
                     # Case C: Changed - field-level diff
                     changes = []
-                    for field, new_v in [("title", rec["Full Journal Title"]), ("publisher", rec["Publisher"]), ("country", rec["Country"])]:
+                    for field, new_v in [("title", rec["Full Journal Title"]), ("publisher", rec["Publisher"]), ("country", rec["Country"]), ("print_issn", rec["Print-ISSN"]), ("e_issn", rec["E-ISSN"])]:
                         old_v = existing.get(field, "")
-                        if _normalize_value(old_v) != _normalize_value(new_v):
+                        if field in ("print_issn", "e_issn"):
+                            if _normalize_value(_n2(old_v)) != _normalize_value(_n2(new_v)):
+                                changes.append(("journal", field, old_v, new_v))
+                        elif _normalize_value(old_v) != _normalize_value(new_v):
                             changes.append(("journal", field, old_v, new_v))
                     cfr_old_sl = old_cfr.get("sl_no", "")
                     if _normalize_value(cfr_old_sl) != _normalize_value(rec["Sl.No"]):
                         changes.append(("cfr", "sl_no", cfr_old_sl, rec["Sl.No"]))
+                    # CFR ISSN/title/publisher/country tracked explicitly
+                    for f, new_v in [("print_issn", rec["Print-ISSN"]), ("e_issn", rec["E-ISSN"]), ("journal_title", rec["Full Journal Title"]), ("publisher", rec["Publisher"]), ("country", rec["Country"])]:
+                        old_v = old_cfr.get(f, "")
+                        if f in ("print_issn", "e_issn"):
+                            if _normalize_value(_n2(old_v)) != _normalize_value(_n2(new_v)):
+                                changes.append(("cfr", f, old_v, new_v))
+                        elif _normalize_value(old_v) != _normalize_value(new_v):
+                            changes.append(("cfr", f, old_v, new_v))
                     for f, new_v in [
                         ("scopus_status", rec["Scopus Indexing Status"]),
                         ("match_type", rec["Scopus Match Type"]),
@@ -874,6 +899,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                         ("sourcerecord_id", rec["Scopus Source Record ID"]),
                         ("scopus_publisher", rec["Scopus Publisher"]),
                         ("scopus_coverage", rec["Scopus Coverage"]),
+                        ("scopus_issn", rec.get("Scopus ISSN", "")),
+                        ("scopus_eissn", rec.get("Scopus EISSN", "")),
+                        ("raw_active_status", rec.get("Scopus Raw Active", "")),
+                        ("raw_discontinued_flag", rec.get("Scopus Raw Discontinued", "")),
                     ]:
                         old_v = old_scopus.get(f, "")
                         if _normalize_value(old_v) != _normalize_value(new_v):
