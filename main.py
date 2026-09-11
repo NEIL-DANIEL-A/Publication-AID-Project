@@ -618,7 +618,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 pub = _normalize_value(e.get("publisher", ""))
                 cur = _normalize_value(e.get("apc_currency", ""))
                 val = _normalize_value(e.get("apc_value", ""))
-                parts.append(f"{pub}:{cur}:{val}")
+                gpoa = _normalize_value(e.get("has_gpoa_discount", False))
+                orig = _normalize_value(e.get("original_apc_value", ""))
+                disc = _normalize_value(e.get("discounted_apc_value", ""))
+                parts.append(f"{pub}:{cur}:{val}:gpoa={gpoa}:orig={orig}:disc={disc}")
             return "|".join(parts)
 
         def _compute_apc_mode_aggregate(apc_entries: List[dict]) -> str:
@@ -668,11 +671,25 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             _apc_mode = rec.get("APC Mode", "no data")
             _apc_for_hash = ""
             _apc_mode_for_hash = ""
+            _has_gpoa_hash = ""
+            _orig_apc_hash = ""
+            _disc_apc_hash = ""
+            _disc_pct_hash = ""
             if _apc_val not in ("no data", "", "N/A"):
                 # Use APC lookup's publisher (not CFR publisher) to match _compute_apc_aggregate
                 _apc_entry = apc_lookup.get(rec["Sl.No"])
                 _apc_pub = _apc_entry.get("publisher", "") if _apc_entry else ""
-                _apc_for_hash = f"{_normalize_value(_apc_pub)}:{_normalize_value(_apc_cur)}:{_normalize_value(_apc_val)}"
+                _has_gpoa = _apc_entry.get("has_gpoa_discount", False) if _apc_entry else False
+                _orig_apc = _apc_entry.get("original_apc_value", "") if _apc_entry else ""
+                _disc_apc = _apc_entry.get("discounted_apc_value", "") if _apc_entry else ""
+                _disc_pct = _apc_entry.get("discount_percent", 0) if _apc_entry else 0
+
+                _has_gpoa_hash = str(_has_gpoa)
+                _orig_apc_hash = str(_orig_apc)
+                _disc_apc_hash = str(_disc_apc)
+                _disc_pct_hash = str(_disc_pct)
+
+                _apc_for_hash = f"{_normalize_value(_apc_pub)}:{_normalize_value(_apc_cur)}:{_normalize_value(_apc_val)}:gpoa={_normalize_value(_has_gpoa_hash)}:orig={_normalize_value(_orig_apc_hash)}:disc={_normalize_value(_disc_apc_hash)}"
                 _apc_mode_for_hash = _normalize_value(_apc_mode) if _apc_mode not in ("no data", "", "N/A") else ""
 
             # Normalize ISSN for hashing so hyphen variations don't create false changes; use _n2 helper
@@ -714,6 +731,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 scimago_url=rec["SCImago URL"],
                 apc_aggregate=_apc_for_hash,
                 apc_mode_aggregate=_apc_mode_for_hash,
+                has_gpoa_discount=_has_gpoa_hash,
+                original_apc_value=_orig_apc_hash,
+                discounted_apc_value=_disc_apc_hash,
+                discount_percent=_disc_pct_hash,
             )
             new_hash = compute_data_hash(hash_input)
 
@@ -1089,15 +1110,25 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 try:
                     from database.repository import create_change_proposals
                     create_change_proposals(pipeline_run_id, proposals)
+                    # Breakdown for transparency: 85 updated vs 20 with APC
+                    _with_apc = sum(1 for p in proposals if p.get("apc_payload") and len(p["apc_payload"]) > 0)
+                    _with_gpoa = sum(1 for p in proposals if any(a.get("has_gpoa_discount") for a in (p.get("apc_payload") or [])))
+                    _by_type = {}
+                    for p in proposals:
+                        _by_type[p["change_type"]] = _by_type.get(p["change_type"], 0) + 1
                     print(f"[SUCCESS] Validation: {len(proposals)} proposals created with status PENDING — awaiting admin approval", flush=True)
-                    print(f"  → Review: SELECT * FROM change_proposals WHERE pipeline_run_id='{pipeline_run_id}' AND status='PENDING'", flush=True)
+                    print(f"  → By type: {_by_type} | with APC: {_with_apc} | GPOA highlighted: {_with_gpoa} | without APC: {len(proposals)-_with_apc}", flush=True)
+                    print(f"  → Note: db_stats.updated={db_stats['updated_records']} == len(MODIFIED)={_by_type.get('MODIFIED',0)}; if diff check journal_changes vs apc_payload->0 filtering", flush=True)
+                    print(f"  → Review: SELECT change_type, status, count(*) FROM change_proposals WHERE pipeline_run_id='{pipeline_run_id}' GROUP BY 1,2", flush=True)
+                    print(f"  → GPOA check: SELECT sl_no, apc_payload->0->>'is_highlighted' FROM change_proposals WHERE pipeline_run_id='{pipeline_run_id}' AND apc_payload IS NOT NULL", flush=True)
                     print(f"  → Approve: python scripts/approve.py --run {pipeline_run_id} --approve-all  (or --proposal <id> --approve)", flush=True)
                 except Exception as e:
                     print(f"[WARNING] Could not create change proposals (table missing? run schema_validation.sql): {e}", flush=True)
             phase3_time = time.perf_counter() - phase3_start
             db_duration = round(phase1_time + phase2_time + phase3_time, 2)
-            print(f"[INFO] DB PHASE 3: Validation proposals complete in {phase3_time:.2f}s (production untouched)", flush=True)
+            print(f"[INFO] DB PHASE 3: Validation proposals complete in {phase3_time:.2f}s (production untouched — check change_proposals, not apc_results)", flush=True)
             print(f"[INFO] DB persistence: {db_stats['new_records']} new | {db_stats['updated_records']} modified | {len(_removed_proposals)} removed | {db_stats['unchanged_records']} unchanged (all pending approval)", flush=True)
+            print(f"[INFO] Tip: apc_results.is_highlighted stays false until approved; see change_proposals.apc_payload->>'is_highlighted' for pending GPOA", flush=True)
             if pipeline_run_id:
                 try:
                     total_duration = round(time.perf_counter() - pipeline_start, 2)

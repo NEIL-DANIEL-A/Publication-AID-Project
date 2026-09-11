@@ -75,6 +75,10 @@ def build_hash_input(
     scimago_url: str = "",
     apc_aggregate: str = "",
     apc_mode_aggregate: str = "",
+    has_gpoa_discount: str = "",
+    original_apc_value: str = "",
+    discounted_apc_value: str = "",
+    discount_percent: str = "",
 ) -> dict:
     """Helper to build consistent dict for hashing from ALL extracted fields (except volatile execution_time/error). Any extracted field change will be detected."""
     return {
@@ -109,4 +113,8 @@ def build_hash_input(
         "scimago_url": scimago_url,
         "apc_aggregate": apc_aggregate,
         "apc_mode_aggregate": apc_mode_aggregate,
+        "has_gpoa_discount": has_gpoa_discount,
+        "original_apc_value": original_apc_value,
+        "discounted_apc_value": discounted_apc_value,
+        "discount_percent": discount_percent,
     }

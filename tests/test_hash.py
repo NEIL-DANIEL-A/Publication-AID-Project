@@ -65,3 +65,11 @@ def test_hash_apc_empty_vs_no_data():
     rec1 = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", apc_aggregate="", apc_mode_aggregate="")
     rec2 = build_hash_input("Nature", "0028-0836", "", "Springer", "UK", apc_aggregate="no data", apc_mode_aggregate="no data")
     assert compute_data_hash(rec1) == compute_data_hash(rec2)
+
+
+def test_hash_gpoa_discount():
+    """Test that changes in GPOA discount attributes alter the calculated hash."""
+    base = build_hash_input("Lancet", "0140-6736", "", "Elsevier", "UK", has_gpoa_discount="False", discount_percent="0")
+    gpoa = build_hash_input("Lancet", "0140-6736", "", "Elsevier", "UK", has_gpoa_discount="True", original_apc_value="5000", discounted_apc_value="4000", discount_percent="20")
+    assert compute_data_hash(base) != compute_data_hash(gpoa)
+
