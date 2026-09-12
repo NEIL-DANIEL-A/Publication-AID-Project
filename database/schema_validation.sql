@@ -90,9 +90,29 @@ WHERE p.status = 'PENDING'
 ORDER BY pr.started_at DESC, p.change_type, p.sl_no;
 
 -- -------------------------------------------------------------------
--- 5. Comments
+-- 5. System Settings (Validation Layer Toggle & Pipeline Config)
+-- Allows frontend admin panel or scripts to toggle validation layer on/off.
+-- If validation_layer_enabled is true, pipeline defaults to proposal creation.
+-- If false, pipeline writes directly to production.
+-- -------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS system_settings (
+    key TEXT PRIMARY KEY,
+    value JSONB NOT NULL,
+    description TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by TEXT DEFAULT 'admin'
+);
+
+INSERT INTO system_settings (key, value, description)
+VALUES 
+    ('validation_layer_enabled', 'true'::jsonb, 'Toggle for Validation & Approval Layer. When true, CI/CD and default pipeline runs store changes as PENDING proposals.')
+ON CONFLICT (key) DO NOTHING;
+
+-- -------------------------------------------------------------------
+-- 6. Comments
 -- -------------------------------------------------------------------
 COMMENT ON TABLE change_proposals IS 'Validation & Approval Layer: each NEW/MODIFIED/REMOVED journal from a pipeline run requires admin approval before touching production tables.';
 COMMENT ON COLUMN change_proposals.old_data IS 'JSON snapshot of production row + children before change (null for NEW)';
 COMMENT ON COLUMN change_proposals.new_data IS 'JSON snapshot of collected data for this run (null for REMOVED)';
 COMMENT ON COLUMN change_proposals.diff_summary IS 'Field-level diff array [{source, field, old_value, new_value}] for MODIFIED; empty for NEW/REMOVED';
+COMMENT ON TABLE system_settings IS 'Global application and pipeline settings accessible by the admin panel.';

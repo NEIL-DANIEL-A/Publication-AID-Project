@@ -20,7 +20,14 @@ import os
 # Allow running as python scripts/approve.py from project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from database.repository import get_pending_proposals, get_proposals_by_run, approve_proposals, reject_proposals
+from database.repository import (
+    get_pending_proposals,
+    get_proposals_by_run,
+    approve_proposals,
+    reject_proposals,
+    get_setting,
+    set_setting,
+)
 
 
 def _print_proposal(p):
@@ -51,7 +58,32 @@ def main():
     parser.add_argument("--reject-all", action="store_true", help="Reject all PENDING for --run")
     parser.add_argument("--note", type=str, default="", help="Review note")
     parser.add_argument("--reviewer", type=str, default="admin", help="Reviewer name")
+    parser.add_argument("--enable-validation", action="store_true", help="Enable Validation Layer globally in system_settings")
+    parser.add_argument("--disable-validation", action="store_true", help="Disable Validation Layer globally (pipelines write direct to production)")
+    parser.add_argument("--status-validation", action="store_true", help="Show current global validation layer status")
     args = parser.parse_args()
+
+    if args.enable_validation:
+        ok = set_setting("validation_layer_enabled", True, updated_by=args.reviewer, description="Validation layer enabled via admin CLI")
+        if ok:
+            print("[SUCCESS] Validation Layer is now ENABLED globally. Pipeline runs will create PENDING proposals.")
+        else:
+            print("[ERROR] Failed to update system_settings.")
+        return
+
+    if args.disable_validation:
+        ok = set_setting("validation_layer_enabled", False, updated_by=args.reviewer, description="Validation layer disabled via admin CLI")
+        if ok:
+            print("[SUCCESS] Validation Layer is now DISABLED globally. Pipeline runs will write directly to production.")
+        else:
+            print("[ERROR] Failed to update system_settings.")
+        return
+
+    if args.status_validation:
+        val = get_setting("validation_layer_enabled", default=True)
+        status_str = "ENABLED (changes require approval)" if val else "DISABLED (changes written directly to production)"
+        print(f"Global Validation Layer Status: {status_str}")
+        return
 
     if args.list:
         run_id = args.run
@@ -99,6 +131,9 @@ def main():
 
     parser.print_help()
     print("\nExamples:")
+    print("  python scripts/approve.py --status-validation")
+    print("  python scripts/approve.py --enable-validation")
+    print("  python scripts/approve.py --disable-validation")
     print("  python scripts/approve.py --run <id> --list")
     print("  python scripts/approve.py --run <id> --approve-all")
     print("  python scripts/approve.py --proposal <id> --approve")

@@ -429,6 +429,11 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
         apc_value_val = apc_res.get("apc_value", "no data") if apc_res else "no data"
         apc_currency_val = apc_res.get("apc_currency", "no data") if apc_res else "no data"
         apc_mode_val = apc_res.get("mode_raw", "no data") if apc_res else "no data"
+        has_gpoa_val = apc_res.get("has_gpoa_discount", False) if apc_res else False
+        orig_apc_val = apc_res.get("original_apc_value", "") if apc_res else ""
+        disc_apc_val = apc_res.get("discounted_apc_value", "") if apc_res else ""
+        disc_pct_val = apc_res.get("discount_percent", 0) if apc_res else 0
+        is_highlighted_val = apc_res.get("is_highlighted", False) if apc_res else False
 
         record = {
             "Sl.No": j.sl_no,
@@ -460,6 +465,11 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             "APC Value": apc_value_val,
             "APC Currency": apc_currency_val,
             "APC Mode": apc_mode_val,
+            "Has GPOA Discount": has_gpoa_val,
+            "Original APC Value": orig_apc_val,
+            "Discounted APC Value": disc_apc_val,
+            "Discount Percent": disc_pct_val,
+            "Is Highlighted": is_highlighted_val,
         }
 
         return idx, record, is_success, j_time, j.journal_title, s_res.scopus_status, sjr_val, q_val, status_display
@@ -529,6 +539,11 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             "APC Value": "no data",
             "APC Currency": "no data",
             "APC Mode": "no data",
+            "Has GPOA Discount": False,
+            "Original APC Value": "",
+            "Discounted APC Value": "",
+            "Discount Percent": 0,
+            "Is Highlighted": False,
         })
 
     # ------------------------------------------------------------------ #
@@ -1361,10 +1376,28 @@ def main():
         run_single_issn(args.issn)
     else:
         scopus_path = args.scopus_file if args.scopus_file else os.path.join(OUTPUT_DIR, "scopus_source_title_list.xlsx")
-        # --validate takes precedence; --direct is default legacy behaviour
-        validate_mode = args.validate and not args.direct
+        # Determine validation mode:
+        # 1. If --direct passed -> False
+        # 2. If --validate passed -> True
+        # 3. If neither specified -> query system_settings.validation_layer_enabled (defaults to True)
+        if args.direct:
+            validate_mode = False
+        elif args.validate:
+            validate_mode = True
+        else:
+            # Query setting from DB if available
+            try:
+                from database.repository import get_setting
+                db_setting = get_setting("validation_layer_enabled", default=True)
+                validate_mode = bool(db_setting) if db_setting is not None else True
+            except Exception:
+                validate_mode = True
+
         if validate_mode:
             print("[INFO] Validation & Approval Layer ENABLED — production will NOT be modified directly; proposals will be created PENDING review")
+        else:
+            print("[INFO] Validation & Approval Layer DISABLED — writing directly to production tables")
+
         run_complete_pipeline(scopus_file=scopus_path, workers=args.workers, validate=validate_mode)
 
 

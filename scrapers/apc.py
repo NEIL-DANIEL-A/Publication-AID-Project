@@ -383,7 +383,7 @@ def _parse_springer_pdf(filepath: str, mode_label: str = "") -> List[dict]:
     return results
 
 
-def _fetch_elsevier_gpoa_issns() -> set:
+def _fetch_elsevier_gpoa_issns(cache_dir: str = None) -> set:
     """
     Fetch Elsevier GPOA (Geographical Pricing for Open Access) pilot list.
     Page: https://www.elsevier.com/about/policies-and-standards/pricing/gpoa-journals-list
@@ -391,7 +391,8 @@ def _fetch_elsevier_gpoa_issns() -> set:
     Returns set of normalized ISSNs (no hyphen, e.g. 00016918).
     Caches to apc_cache/Elsevier_GPOA.json for offline use.
     """
-    cache_path = os.path.join(APC_CACHE_DIR, "Elsevier_GPOA.json")
+    target_cache_dir = cache_dir or APC_CACHE_DIR
+    cache_path = os.path.join(target_cache_dir, "Elsevier_GPOA.json")
     gpoa_set = set()
     # Try live fetch
     try:
@@ -410,7 +411,7 @@ def _fetch_elsevier_gpoa_issns() -> set:
                 gpoa_set.add(norm)
         if gpoa_set:
             try:
-                os.makedirs(APC_CACHE_DIR, exist_ok=True)
+                os.makedirs(target_cache_dir, exist_ok=True)
                 import json as _json
                 with open(cache_path, "w", encoding="utf-8") as f:
                     _json.dump(sorted(gpoa_set), f, indent=2)
@@ -627,7 +628,7 @@ class APCVerifier:
 
         # Fetch Elsevier GPOA list (20% off pilot) and annotate Elsevier records
         print(f"  [APC] Loading Elsevier GPOA (20% off)...", end=" ", flush=True)
-        self.gpoa_issns = _fetch_elsevier_gpoa_issns()
+        self.gpoa_issns = _fetch_elsevier_gpoa_issns(self.cache_dir)
         all_records = _apply_gpoa_discount(all_records, self.gpoa_issns, percent=20)
         gpoa_hits = sum(1 for r in all_records if r.get("has_gpoa_discount"))
         self.stats["elsevier_gpoa_count"] = gpoa_hits

@@ -775,3 +775,38 @@ def reject_proposals(proposal_ids: List[str], reviewed_by: str = "admin", note: 
             except Exception:
                 pass
     return len(proposal_ids)
+
+
+# ------------------------------------------------------------------ #
+# SYSTEM SETTINGS (Admin Panel Toggle)
+# ------------------------------------------------------------------ #
+def get_setting(key: str, default=None):
+    """Retrieve setting value by key from system_settings table."""
+    client = get_supabase_client()
+    try:
+        res = client.table("system_settings").select("value").eq("key", key).limit(1).execute()
+        if res.data:
+            return res.data[0].get("value")
+        return default
+    except Exception as e:
+        logger.warning(f"Could not read setting '{key}': {e}")
+        return default
+
+
+def set_setting(key: str, value, updated_by: str = "admin", description: str = "") -> bool:
+    """Upsert setting value in system_settings table."""
+    client = get_supabase_client()
+    payload = {
+        "key": key,
+        "value": value,
+        "updated_at": "now()",
+        "updated_by": updated_by,
+    }
+    if description:
+        payload["description"] = description
+    try:
+        client.table("system_settings").upsert(payload, on_conflict="key").execute()
+        return True
+    except Exception as e:
+        logger.warning(f"Could not update setting '{key}': {e}")
+        return False

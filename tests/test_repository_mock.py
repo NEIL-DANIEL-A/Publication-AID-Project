@@ -35,3 +35,20 @@ def test_hash_integration_with_normalize():
     )
     h = compute_data_hash(rec)
     assert len(h) == 64
+
+
+def test_get_setting_and_set_setting():
+    from database.repository import get_setting, set_setting
+
+    mock_client = MagicMock()
+    mock_select = MagicMock()
+    mock_select.execute.return_value.data = [{"value": True}]
+    mock_client.table.return_value.select.return_value.eq.return_value.limit.return_value = mock_select
+    mock_client.table.return_value.upsert.return_value.execute.return_value.data = [{"key": "validation_layer_enabled", "value": False}]
+
+    with patch("database.repository.get_supabase_client", return_value=mock_client):
+        val = get_setting("validation_layer_enabled", default=False)
+        assert val is True
+
+        res = set_setting("validation_layer_enabled", False, updated_by="admin")
+        assert res is True
