@@ -1,6 +1,6 @@
 # PROJECT_WORKING.md — Complete End-to-End Documentation
 
-> **Last updated**: 2026-09-07 | **Repository**: Publication-AID-Project  
+> **Last updated**: 2026-09-12 | **Repository**: Publication-AID-Project  
 > **Purpose**: Explain the ACTUAL working of the entire project from start to finish, based strictly on the current source code.
 
 ---
@@ -9,11 +9,13 @@
 
 Publication-AID is an automated Python pipeline that:
 
-1. **Collects** academic journal listings from the CFR Anna University portal (Chennai, India)
+1. **Collects** academic journal listings from the CFR Anna University portal (Chennai, India) (~12,201 journals across disciplines)
 2. **Verifies** each journal's Scopus indexing status against the official Elsevier Source Title List
-3. **Verifies** each journal's Clarivate Master Journal List (MJL / Web of Science) indexing
-4. **Scrapes** SCImago Journal Rank (SJR) scientometrics for each journal
-5. **Persists** all data incrementally to Supabase PostgreSQL, detecting new/changed/unchanged records via SHA256 hash of 29 fields
+3. **Fetches & Calculates** Article Processing Charges (APC) and Elsevier GPOA discounts across Wiley, Elsevier, Springer Nature, SAGE, and OUP
+4. **Verifies** each journal's Clarivate Master Journal List (MJL / Web of Science) indexing
+5. **Scrapes** SCImago Journal Rank (SJR) scientometrics for each journal
+6. **Validates & Proposes** changes via a Validation & Approval Layer (`change_proposals` table, avoiding direct production writes in `--validate` mode)
+7. **Persists** all data incrementally to Supabase PostgreSQL, detecting new/changed/unchanged records via SHA256 hash of 35 normalized fields (plus APC aggregates)
 
 The pipeline runs daily via GitHub Actions cron at 02:00 IST.
 
@@ -97,32 +99,35 @@ The pipeline runs daily via GitHub Actions cron at 02:00 IST.
 
 ```
 Publication-AID-Project/
-├── main.py                      # CLI entry + 4-stage orchestrator (946 lines)
-├── models.py                    # 4 dataclasses: CFRJournal, ScopusVerificationResult,
-│                                #   MJLVerificationResult, JournalResult (63 lines)
+├── main.py                      # CLI entry + 4-stage orchestrator (1,353 lines)
+├── models.py                    # Dataclasses: CFRJournal, ScopusVerificationResult,
+│                                #   MJLVerificationResult, JournalResult, APCResult (65 lines)
 ├── config/
 │   ├── __init__.py              # empty
-│   └── urls.py                  # Centralized URLs for all 4 stages (26 lines)
+│   ├── apc_sources.py           # Publisher APC URLs & parsing rules (120 lines)
+│   └── urls.py                  # Centralized URLs for all stages (26 lines)
 ├── database/
 │   ├── __init__.py              # Re-exports get_supabase_client, CRUD functions
 │   ├── connection.py            # Supabase client singleton, env validation (43 lines)
 │   ├── hash.py                  # SHA256 hashing, 29-field builder, normalization (108 lines)
-│   ├── repository.py            # Bulk read/write, per-journal CRUD, pipeline runs (414 lines)
-│   └── schema.sql               # 7 tables + indexes + triggers (198 lines)
+│   ├── repository.py            # Bulk read/write, validation proposals, pipeline runs (687 lines)
+│   ├── schema.sql               # Base tables + indexes + triggers (198 lines)
+│   └── schema_validation.sql    # Validation & Approval Layer schema (99 lines)
 ├── scrapers/
 │   ├── __init__.py              # Re-exports all scraper classes/functions
 │   ├── cfr_data_collection.py   # CFR portal scraper (243 lines)
 │   ├── scopus.py                # Local Scopus verification via Excel (294 lines)
 │   ├── mjl.py                   # Hybrid MJL: POST + Playwright (577 lines)
-│   └── scimago.py               # SCImago scraper with RLock (516 lines)
+│   ├── scimago.py               # SCImago scraper with RLock (516 lines)
+│   └── apc.py                   # Article Processing Charge (APC) scraper (310 lines)
 ├── processors/
 │   ├── __init__.py              # Re-exports normalize_issn
 │   └── issn.py                  # ISSN normalization (24 lines)
 ├── tests/
 │   ├── __init__.py              # empty
-│   ├── test_hash.py             # 5 hash tests
-│   ├── test_change_detection.py # 5 incremental behavior tests
-│   └── test_repository_mock.py  # 3 repository logic tests
+│   ├── test_hash.py             # Hash & ISSN normalization tests
+│   ├── test_change_detection.py # Incremental behavior & proposal deduplication tests
+│   └── test_repository_mock.py  # Repository logic tests
 ├── output/
 │   ├── .gitkeep                 # kept in git
 │   ├── scopus_source_title_list.xlsx  # 19MB downloaded Scopus list (gitignored)
@@ -132,7 +137,7 @@ Publication-AID-Project/
 ├── .env.example                 # Template
 ├── .gitignore                   # 46 lines
 ├── .github/workflows/cron.yml   # Daily 02:00 IST cron
-├── requirements.txt             # 5 dependencies
+├── requirements.txt             # Dependencies
 └── README.md                    # Project overview
 ```
 
@@ -873,9 +878,9 @@ This is O(1) per journal, all in memory.
 
 ## 14. Hashing and Change Detection
 
-### `database/hash.py` — 29 Fields
+### `database/hash.py` — 35 Fields
 
-`build_hash_input()` (line 46) accepts 29 parameters and returns a dict with 29 keys:
+`build_hash_input()` (line 46) accepts 35 parameters and returns a dict with 35 keys:
 
 | # | Key | Source |
 |---|-----|--------|
@@ -908,6 +913,12 @@ This is O(1) per journal, all in memory.
 | 27 | `h_index` | SCImago H-Index |
 | 28 | `scimago_coverage` | SCImago coverage |
 | 29 | `scimago_url` | SCImago URL |
+| 30 | `apc_aggregate` | Aggregated APC pricing strings |
+| 31 | `apc_mode_aggregate` | Aggregated APC modes |
+| 32 | `has_gpoa_discount` | Elsevier GPOA discount flag |
+| 33 | `original_apc_value` | Original APC before discount |
+| 34 | `discounted_apc_value` | Discounted APC value |
+| 35 | `discount_percent` | Discount percentage (20) |
 
 (Note: `scopus_issn`, `scopus_eissn`, `scopus_raw_active`, `scopus_raw_discontinued` are passed as empty strings — included in hash for future use but currently static.)
 

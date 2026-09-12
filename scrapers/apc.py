@@ -506,19 +506,20 @@ def _normalize_mode(mode_raw: str) -> str:
 
 def _build_issn_map(records: List[dict]) -> Dict[str, List[dict]]:
     """
-    Build ISSN -> list of APC records, deduplicated per (issn, publisher).
-    If the same ISSN appears multiple times from the same publisher (e.g. different
-    license modes in Wiley OA + Hybrid files), keep only the first occurrence.
-    Returns dict: normalized_issn -> [{"apc_value", "apc_currency", "mode_raw", "publisher", "mode_normalized", "has_gpoa_discount", "original_apc_value", "discounted_apc_value", "is_highlighted"}, ...]
+    Build ISSN -> list of APC records, deduplicated per (issn, publisher, apc_currency).
+    If the same ISSN appears multiple times from the same publisher with the same currency,
+    keep only the first occurrence while preserving multi-currency pricing (e.g. SAGE USD & GBP).
+    Returns dict: normalized_issn -> [{"apc_value", "apc_currency", "mode_raw", "publisher", ...}, ...]
     """
     issn_map: Dict[str, List[dict]] = {}
-    seen_publishers: Dict[str, set] = {}  # issn -> set of publishers already added
+    seen_keys: Dict[str, set] = {}  # issn -> set of (publisher, currency) tuples already added
     for rec in records:
         issn = rec["issn"]
         publisher = rec.get("publisher", "")
+        currency = rec.get("apc_currency", "")
         entry = {
             "apc_value": rec.get("apc_value", ""),
-            "apc_currency": rec.get("apc_currency", ""),
+            "apc_currency": currency,
             "mode_raw": rec.get("mode_raw", ""),
             "mode_normalized": _normalize_mode(rec.get("mode_raw", "")),
             "publisher": publisher,
@@ -529,12 +530,13 @@ def _build_issn_map(records: List[dict]) -> Dict[str, List[dict]]:
             "discount_percent": rec.get("discount_percent", 0),
             "is_highlighted": rec.get("is_highlighted", False),
         }
+        dedup_key = (publisher, currency)
         if issn not in issn_map:
             issn_map[issn] = []
-            seen_publishers[issn] = set()
-        if publisher not in seen_publishers[issn]:
+            seen_keys[issn] = set()
+        if dedup_key not in seen_keys[issn]:
             issn_map[issn].append(entry)
-            seen_publishers[issn].add(publisher)
+            seen_keys[issn].add(dedup_key)
     return issn_map
 
 

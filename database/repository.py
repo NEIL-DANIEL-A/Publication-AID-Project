@@ -1,8 +1,11 @@
+import logging
 import time
 from typing import Dict, List, Optional, Tuple
 
 from database.connection import get_supabase_client
 from processors.issn import normalize_issn
+
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ #
@@ -92,9 +95,19 @@ def get_all_journals_map() -> Dict[str, dict]:
 
 
 def get_all_journals_raw() -> List[dict]:
+    """Fetch all journals raw rows with PostgREST range pagination to avoid 1000 row truncation."""
     client = get_supabase_client()
-    res = client.table("journals").select("*").execute()
-    return res.data or []
+    all_rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        res = client.table("journals").select("*").range(offset, offset + page_size - 1).execute()
+        rows = res.data or []
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return all_rows
 
 
 def insert_journal_full(journal_data: dict, cfr_data: dict, scopus_data: dict, mjl_data: dict, scimago_data: dict, data_hash: str, pipeline_run_id: str) -> str:
@@ -466,9 +479,9 @@ def bulk_upsert_apc(rows: List[dict]):
 
 def create_change_proposals(pipeline_run_id: str, proposals: List[dict]) -> List[dict]:
     """
-    Bulk insert change proposals for a validation run.
+    Bulk insert or update change proposals for a validation run.
     Each proposal dict must contain: change_type, status, journal_id (nullable), sl_no, old_data, new_data, diff_summary, journal_payload, cfr_payload, scopus_payload, mjl_payload, scimago_payload, apc_payload, data_hash
-    Returns inserted rows.
+    Returns inserted/updated rows.
     """
     if not proposals:
         return []
@@ -477,17 +490,115 @@ def create_change_proposals(pipeline_run_id: str, proposals: List[dict]) -> List
     for p in proposals:
         p["pipeline_run_id"] = pipeline_run_id
         p.setdefault("status", "PENDING")
+
+    # Bulk query existing pending proposal IDs in chunks to avoid N+1 queries
+    existing_by_jid: Dict[str, str] = {}
+    existing_by_sl: Dict[str, str] = {}
+
+    jids = [p["journal_id"] for p in proposals if p.get("journal_id")]
+    sl_nos = [str(p["sl_no"]) for p in proposals if not p.get("journal_id") and p.get("sl_no")]
+
+    CHUNK = 500
+    if jids:
+        for i in range(0, len(jids), CHUNK):
+            chunk_jids = jids[i:i + CHUNK]
+            try:
+                res = client.table("change_proposals").select("id, journal_id").eq("status", "PENDING").in_("journal_id", chunk_jids).execute()
+                for r in (res.data or []):
+                    if r.get("journal_id"):
+                        existing_by_jid[r["journal_id"]] = r["id"]
+            except Exception as e:
+                logger.warning(f"Failed to query existing pending proposals by journal_id: {e}")
+
+    if sl_nos:
+        for i in range(0, len(sl_nos), CHUNK):
+            chunk_sls = sl_nos[i:i + CHUNK]
+            try:
+                res = client.table("change_proposals").select("id, sl_no").eq("status", "PENDING").is_("journal_id", "null").in_("sl_no", chunk_sls).execute()
+                for r in (res.data or []):
+                    if r.get("sl_no"):
+                        existing_by_sl[str(r["sl_no"])] = r["id"]
+            except Exception as e:
+                logger.warning(f"Failed to query existing pending proposals by sl_no: {e}")
+
     inserted = []
-    for i in range(0, len(proposals), BATCH_SIZE):
-        chunk = proposals[i:i + BATCH_SIZE]
+    to_insert = []
+
+    for p in proposals:
+        jid = p.get("journal_id")
+        sl_no = str(p.get("sl_no", "")) if p.get("sl_no") else ""
+        
+        target_pid = None
+        if jid and jid in existing_by_jid:
+            target_pid = existing_by_jid[jid]
+        elif not jid and sl_no and sl_no in existing_by_sl:
+            target_pid = existing_by_sl[sl_no]
+
+        if target_pid:
+            try:
+                up_res = client.table("change_proposals").update(p).eq("id", target_pid).execute()
+                if up_res.data:
+                    inserted.extend(up_res.data)
+            except Exception as e:
+                logger.warning(f"Failed to update pending proposal {target_pid}: {e}")
+        else:
+            to_insert.append(p)
+
+    for i in range(0, len(to_insert), BATCH_SIZE):
+        chunk = to_insert[i:i + BATCH_SIZE]
         res = client.table("change_proposals").insert(chunk).execute()
         inserted.extend(res.data or [])
+
     # Mark run as pending_review
     try:
         client.table("pipeline_runs").update({"validation_status": "pending_review", "requires_approval": True}).eq("id", pipeline_run_id).execute()
     except Exception:
         pass
     return inserted
+
+
+def bulk_get_pending_proposals_map() -> Dict[str, dict]:
+    """
+    Fetch all active PENDING change proposals in paginated queries.
+    Returns dict:
+    - journal_id -> pending_proposal_dict (for existing journals)
+    - "_by_sl_no" -> dict mapping sl_no -> proposal dict (for NEW proposals)
+    - "_by_hash" -> dict mapping data_hash -> proposal dict (for NEW proposals)
+    """
+    client = get_supabase_client()
+    try:
+        all_rows = []
+        limit = 1000
+        offset = 0
+        while True:
+            res = client.table("change_proposals").select("*").eq("status", "PENDING").range(offset, offset + limit - 1).execute()
+            rows = res.data or []
+            all_rows.extend(rows)
+            if len(rows) < limit:
+                break
+            offset += limit
+
+        by_jid = {}
+        by_sl_no = {}
+        by_hash = {}
+        for r in all_rows:
+            jid = r.get("journal_id")
+            if jid:
+                by_jid[jid] = r
+            sl = r.get("sl_no")
+            if sl:
+                by_sl_no[str(sl)] = r
+            dh = r.get("data_hash")
+            if dh:
+                by_hash[dh] = r
+
+        result = {**by_jid}
+        result["_by_sl_no"] = by_sl_no
+        result["_by_hash"] = by_hash
+        return result
+    except Exception as e:
+        logger.warning(f"Failed to fetch bulk pending proposals: {e}")
+        return {"_by_sl_no": {}, "_by_hash": {}}
 
 
 def get_pending_proposals(pipeline_run_id: str = None) -> List[dict]:
@@ -539,12 +650,15 @@ def approve_proposals(proposal_ids: List[str], reviewed_by: str = "admin", note:
         j_payload = p.get("journal_payload") or {}
         if ctype == "NEW":
             to_insert_journals.append(j_payload)
+            sl_no_val = str(p.get("sl_no", ""))
             if p.get("cfr_payload"): to_insert_cfr.append(p["cfr_payload"])
             if p.get("scopus_payload"): to_insert_scopus.append(p["scopus_payload"])
             if p.get("mjl_payload"): to_insert_mjl.append(p["mjl_payload"])
             if p.get("scimago_payload"): to_insert_scimago.append(p["scimago_payload"])
             for apc in (p.get("apc_payload") or []):
-                to_upsert_apc_all.append(apc)  # journal_id placeholder for NEW
+                apc_entry = dict(apc)
+                apc_entry["_sl_no"] = sl_no_val
+                to_upsert_apc_all.append(apc_entry)
         elif ctype == "MODIFIED":
             j_payload["id"] = p.get("journal_id")
             to_update_journals.append(j_payload)
@@ -556,7 +670,7 @@ def approve_proposals(proposal_ids: List[str], reviewed_by: str = "admin", note:
                         payload["journal_id"] = p.get("journal_id")
                     lst.append(payload)
             for apc in (p.get("apc_payload") or []):
-                to_upsert_apc_all.append(apc)
+                to_upsert_apc_all.append(dict(apc))
             # journal_changes from diff_summary
             for diff in (p.get("diff_summary") or []):
                 to_upsert_changes.append({
@@ -580,14 +694,17 @@ def approve_proposals(proposal_ids: List[str], reviewed_by: str = "admin", note:
         journal_ids_touched.add(p.get("pipeline_run_id"))
 
     applied = 0
+    sl_to_jid = {}
     # Apply NEW
     if to_insert_journals:
         inserted = bulk_insert_journals(to_insert_journals)
-        # Map inserted ids to apc placeholder rewrites for NEW
-        # to_insert_cfr/scopus etc need journal_id assignment
+        # Map inserted ids to child tables and apc placeholder rewrites for NEW
         new_ids = [r["id"] for r in inserted]
         for i, jid in enumerate(new_ids):
-            if i < len(to_insert_cfr): to_insert_cfr[i]["journal_id"] = jid
+            if i < len(to_insert_cfr):
+                to_insert_cfr[i]["journal_id"] = jid
+                if to_insert_cfr[i].get("sl_no"):
+                    sl_to_jid[str(to_insert_cfr[i]["sl_no"])] = jid
             if i < len(to_insert_scopus): to_insert_scopus[i]["journal_id"] = jid
             if i < len(to_insert_mjl): to_insert_mjl[i]["journal_id"] = jid
             if i < len(to_insert_scimago): to_insert_scimago[i]["journal_id"] = jid
@@ -595,8 +712,6 @@ def approve_proposals(proposal_ids: List[str], reviewed_by: str = "admin", note:
         bulk_upsert_child("scopus_results", to_insert_scopus)
         bulk_upsert_child("mjl_results", to_insert_mjl)
         bulk_upsert_child("scimago_results", to_insert_scimago)
-        # Fix apc placeholder journal_id for NEW (they were stored with "" )
-        # Re-assign by sl_no matching
         applied += len(inserted)
     if to_update_journals:
         bulk_update_journals(to_update_journals)
@@ -606,10 +721,14 @@ def approve_proposals(proposal_ids: List[str], reviewed_by: str = "admin", note:
         bulk_upsert_child("scimago_results", to_update_scimago)
         applied += len(to_update_journals)
     if to_upsert_apc_all:
-        # Filter to only those with journal_id (NEW apc already needs re-mapping if inserted)
-        # For simplicity, apc for NEW with placeholder "" are skipped here; they would need sl_no loop —
-        # handled above via new_ids mapping would require sl_no→id map. For MODIFIED they already have id.
-        real_apc = [r for r in to_upsert_apc_all if r.get("journal_id")]
+        real_apc = []
+        for r in to_upsert_apc_all:
+            apc_copy = dict(r)
+            sl = apc_copy.pop("_sl_no", None)
+            if not apc_copy.get("journal_id") and sl and str(sl) in sl_to_jid:
+                apc_copy["journal_id"] = sl_to_jid[str(sl)]
+            if apc_copy.get("journal_id"):
+                real_apc.append(apc_copy)
         if real_apc:
             bulk_upsert_apc(real_apc)
     if to_upsert_changes:

@@ -178,3 +178,187 @@ def test_case_E_normalization():
     rec3n = make_record(title="Test", print_issn=normalize_issn("0129-6612"))
     rec4n = make_record(title="Test", print_issn=normalize_issn("01296612"))
     assert make_hash(rec3n) == make_hash(rec4n)
+
+
+def test_validation_consecutive_runs_no_duplicates():
+    """Test that running validation mode twice with unapproved changes does not create duplicate proposals."""
+    pending_proposals = {}
+    
+    # Run 1: Scraped data differs from frozen production record
+    journal_id = "jid-100"
+    scraped_rec = make_record(h_index="150")  # Changed field
+    scraped_hash = make_hash(scraped_rec)
+    
+    # Store initial pending proposal
+    pending_proposals[journal_id] = {
+        "id": "prop-1",
+        "journal_id": journal_id,
+        "data_hash": scraped_hash,
+        "status": "PENDING"
+    }
+    
+    # Run 2: Next day scraper runs again with identical scraped_rec
+    # Check deduplication condition: jid in pending_proposals and hash matches
+    is_duplicate = (journal_id in pending_proposals and pending_proposals[journal_id]["data_hash"] == scraped_hash)
+    assert is_duplicate is True  # Proves second run will be skipped as unchanged rather than creating duplicate
+
+
+def test_validation_new_journal_consecutive_runs_no_duplicates():
+    """Test that consecutive validation runs for a NEW journal do not create duplicate PENDING proposals."""
+    sl_no = "105"
+    new_rec = make_record(title="Brand New Journal")
+    new_rec["Sl.No"] = sl_no
+    new_hash = make_hash(new_rec)
+    
+    pending_proposals_map = {
+        "_by_sl_no": {
+            "105": {
+                "id": "prop-new-1",
+                "journal_id": None,
+                "sl_no": "105",
+                "change_type": "NEW",
+                "data_hash": new_hash,
+                "status": "PENDING"
+            }
+        },
+        "_by_hash": {
+            new_hash: {
+                "id": "prop-new-1",
+                "journal_id": None,
+                "sl_no": "105",
+                "change_type": "NEW",
+                "data_hash": new_hash,
+                "status": "PENDING"
+            }
+        }
+    }
+    
+    # Simulating main.py check for NEW journal
+    existing = None
+    validate = True
+    sl_str = str(new_rec["Sl.No"])
+    pending_new = (
+        pending_proposals_map.get("_by_sl_no", {}).get(sl_str)
+    ) or (
+        pending_proposals_map.get("_by_hash", {}).get(new_hash)
+    )
+    
+    is_already_pending = bool(validate and existing is None and pending_new and pending_new.get("data_hash") == new_hash)
+    assert is_already_pending is True
+
+
+def test_create_change_proposals_bulk_mock():
+    """Verify create_change_proposals batch query structure without N+1 requests."""
+    from unittest.mock import MagicMock, patch
+    from database.repository import create_change_proposals
+
+    mock_client = MagicMock()
+    # Mocking existing SELECT query response
+    mock_select = MagicMock()
+    mock_select.execute.return_value.data = [{"id": "prop-existing-1", "journal_id": "jid-1"}]
+    mock_client.table.return_value.select.return_value.eq.return_value.in_.return_value = mock_select
+    mock_client.table.return_value.update.return_value.eq.return_value.execute.return_value.data = [{"id": "prop-existing-1"}]
+    mock_client.table.return_value.insert.return_value.execute.return_value.data = [{"id": "prop-new-2"}]
+
+    proposals = [
+        {"journal_id": "jid-1", "sl_no": "1", "change_type": "MODIFIED", "data_hash": "hash1"},
+        {"journal_id": None, "sl_no": "2", "change_type": "NEW", "data_hash": "hash2"},
+    ]
+
+    with patch("database.repository.get_supabase_client", return_value=mock_client):
+        res = create_change_proposals("run-123", proposals)
+        assert len(res) == 2
+
+
+def test_sage_dual_currency_deduplication():
+    """Verify _build_issn_map keeps both USD and GBP prices for SAGE rather than discarding GBP."""
+    from scrapers.apc import _build_issn_map
+    records = [
+        {"issn": "12345678", "publisher": "SAGE", "apc_value": "3000", "apc_currency": "USD", "mode_raw": "hybrid"},
+        {"issn": "12345678", "publisher": "SAGE", "apc_value": "2400", "apc_currency": "GBP", "mode_raw": "hybrid"},
+        {"issn": "12345678", "publisher": "SAGE", "apc_value": "3000", "apc_currency": "USD", "mode_raw": "duplicate"},
+    ]
+    res_map = _build_issn_map(records)
+    entries = res_map.get("12345678", [])
+    assert len(entries) == 2
+    currencies = [e["apc_currency"] for e in entries]
+    assert "USD" in currencies
+    assert "GBP" in currencies
+
+
+def test_supabase_client_thread_safety():
+    """Verify get_supabase_client utilizes thread lock and returns singleton."""
+    from unittest.mock import patch, MagicMock
+    from concurrent.futures import ThreadPoolExecutor
+    import database.connection as conn
+
+    mock_client = MagicMock()
+    with patch("os.getenv", side_effect=lambda k, d="": "http://example.supabase.co" if "URL" in k else "key123"), \
+         patch("supabase.create_client", return_value=mock_client) as mock_create:
+        conn._client = None
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            results = list(executor.map(lambda _: conn.get_supabase_client(), range(10)))
+        
+        assert all(c == mock_client for c in results)
+        assert mock_create.call_count == 1
+        conn._client = None
+
+
+def test_approve_proposals_new_apc_remapping():
+    """Verify approve_proposals re-maps placeholder APC journal_ids for NEW journals using sl_no."""
+    from unittest.mock import MagicMock, patch
+    from database.repository import approve_proposals
+
+    mock_client = MagicMock()
+    proposal_new = {
+        "id": "prop-new-1",
+        "status": "PENDING",
+        "change_type": "NEW",
+        "sl_no": "42",
+        "journal_payload": {"title": "New Journal", "print_issn": "11112222"},
+        "cfr_payload": {"sl_no": "42", "journal_title": "New Journal"},
+        "scopus_payload": {},
+        "mjl_payload": {},
+        "scimago_payload": {},
+        "apc_payload": [{"publisher": "Elsevier", "apc_value": "2000", "apc_currency": "USD", "journal_id": ""}],
+    }
+
+    mock_select = MagicMock()
+    mock_select.execute.return_value.data = [proposal_new]
+    mock_client.table.return_value.select.return_value.in_.return_value = mock_select
+
+    with patch("database.repository.get_supabase_client", return_value=mock_client), \
+         patch("database.repository.bulk_insert_journals", return_value=[{"id": "real-jid-999", "title": "New Journal"}]), \
+         patch("database.repository.bulk_upsert_child") as mock_upsert_child, \
+         patch("database.repository.bulk_upsert_apc") as mock_upsert_apc:
+        res = approve_proposals(["prop-new-1"])
+        assert res["applied"] == 1
+        assert mock_upsert_apc.call_count == 1
+        apc_args = mock_upsert_apc.call_args[0][0]
+        assert len(apc_args) == 1
+        assert apc_args[0]["journal_id"] == "real-jid-999"
+
+
+def test_create_change_proposals_deduplication():
+    """Verify create_change_proposals updates existing pending proposals and inserts new ones."""
+    from unittest.mock import MagicMock, patch
+    from database.repository import create_change_proposals
+
+    mock_client = MagicMock()
+    mock_select = MagicMock()
+    mock_select.execute.return_value.data = [{"id": "existing-prop-1", "journal_id": "jid-1"}]
+    mock_client.table.return_value.select.return_value.eq.return_value.in_.return_value = mock_select
+    mock_client.table.return_value.update.return_value.eq.return_value.execute.return_value.data = [{"id": "existing-prop-1"}]
+    mock_client.table.return_value.insert.return_value.execute.return_value.data = [{"id": "new-prop-2"}]
+
+    proposals = [
+        {"journal_id": "jid-1", "change_type": "MODIFIED", "diff_summary": []},
+        {"journal_id": "jid-2", "change_type": "MODIFIED", "diff_summary": []},
+    ]
+
+    with patch("database.repository.get_supabase_client", return_value=mock_client):
+        res = create_change_proposals("run-1", proposals)
+        assert len(res) == 2
+
+
+

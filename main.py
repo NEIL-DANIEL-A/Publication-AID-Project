@@ -578,14 +578,16 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             journals_map = get_all_journals_map()
             unique_journals = len(set(v["id"] for v in journals_map.values())) if journals_map else 0
             journal_ids = list(set(v["id"] for v in journals_map.values())) if journals_map else []
-            # Bulk fetch all 5 child tables (1 query each)
+            # Bulk fetch all 5 child tables (1 query each) + pending proposals
             cfr_map = bulk_get_child_map("cfr_results", journal_ids)
             scopus_map = bulk_get_child_map("scopus_results", journal_ids)
             mjl_map = bulk_get_child_map("mjl_results", journal_ids)
             scimago_map = bulk_get_child_map("scimago_results", journal_ids)
             apc_map = bulk_get_apc_map(journal_ids)
+            from database.repository import bulk_get_pending_proposals_map
+            pending_proposals_map = bulk_get_pending_proposals_map()
             phase1_time = time.perf_counter() - phase1_start
-            print(f"[INFO] DB PHASE 1: Loaded {unique_journals} journals + {len(cfr_map)} cfr + {len(scopus_map)} scopus + {len(mjl_map)} mjl + {len(scimago_map)} scimago + {len(apc_map)} apc in {phase1_time:.2f}s (6 queries)", flush=True)
+            print(f"[INFO] DB PHASE 1: Loaded {unique_journals} journals + {len(cfr_map)} cfr + {len(scopus_map)} scopus + {len(mjl_map)} mjl + {len(scimago_map)} scimago + {len(apc_map)} apc + {len(pending_proposals_map)} pending proposals in {phase1_time:.2f}s", flush=True)
         except Exception as e:
             print(f"[WARNING] Bulk fetch failed, falling back to per-journal lookup: {e}")
             journals_map = {}
@@ -594,6 +596,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             mjl_map = {}
             scimago_map = {}
             apc_map = {}
+            pending_proposals_map = {}
 
         def _lookup_existing(print_raw, e_raw):
             for norm in (_norm(print_raw), _norm(e_raw)):
@@ -806,36 +809,49 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             existing = _lookup_existing(rec["Print-ISSN"], rec["E-ISSN"])
 
             if existing is None:
-                # Case A: New - collect for bulk insert
-                to_insert_journals.append(journal_row)
-                to_insert_cfr.append(cfr_row)
-                to_insert_scopus.append(scopus_row)
-                to_insert_mjl.append(mjl_row)
-                to_insert_scimago.append(scimago_row)
-                # Collect APC rows (1:many - could be multiple publishers)
-                _apc_entries = apc_lookup.get(rec["Sl.No"], [])
-                if _apc_entries:
-                    _apc_list = [_apc_entries] if isinstance(_apc_entries, dict) else _apc_entries
-                    for _apc_e in _apc_list:
-                        to_upsert_apc.append({
-                            "journal_id": "",  # filled after bulk insert
-                            "publisher": _apc_e.get("publisher", ""),
-                            "apc_value": _apc_e.get("apc_value", ""),
-                            "apc_currency": _apc_e.get("apc_currency", ""),
-                            "apc_mode_raw": _apc_e.get("mode_raw", ""),
-                            "apc_mode_normalized": _apc_e.get("mode_normalized", ""),
-                            "has_gpoa_discount": _apc_e.get("has_gpoa_discount", False),
-                            "original_apc_value": _apc_e.get("original_apc_value", _apc_e.get("apc_value", "")),
-                            "discounted_apc_value": _apc_e.get("discounted_apc_value", _apc_e.get("apc_value", "")),
-                            "discount_percent": _apc_e.get("discount_percent", 0),
-                            "is_highlighted": _apc_e.get("is_highlighted", False),
-                            "source_file": "bulk",
-                        })
-                # Track for duplicate ISSN within same run
-                for norm in (norm_p, norm_e):
-                    if norm and norm != "no data":
-                        new_issn_map[norm] = len(to_insert_journals) - 1  # index into list
-                db_stats["new_records"] += 1
+                # In validation mode, check if a pending NEW proposal already exists with identical data_hash
+                sl_str = str(rec.get("Sl.No", ""))
+                pending_new = (
+                    pending_proposals_map.get("_by_sl_no", {}).get(sl_str)
+                    if isinstance(pending_proposals_map.get("_by_sl_no"), dict) else None
+                ) or (
+                    pending_proposals_map.get("_by_hash", {}).get(new_hash)
+                    if isinstance(pending_proposals_map.get("_by_hash"), dict) else None
+                )
+                if validate and pending_new and pending_new.get("data_hash") == new_hash:
+                    # Pending proposal for this new journal already exists with identical data
+                    db_stats["unchanged_records"] += 1
+                else:
+                    # Case A: New - collect for bulk insert (or proposal creation in validation mode)
+                    to_insert_journals.append(journal_row)
+                    to_insert_cfr.append(cfr_row)
+                    to_insert_scopus.append(scopus_row)
+                    to_insert_mjl.append(mjl_row)
+                    to_insert_scimago.append(scimago_row)
+                    # Collect APC rows (1:many - could be multiple publishers)
+                    _apc_entries = apc_lookup.get(rec["Sl.No"], [])
+                    if _apc_entries:
+                        _apc_list = [_apc_entries] if isinstance(_apc_entries, dict) else _apc_entries
+                        for _apc_e in _apc_list:
+                            to_upsert_apc.append({
+                                "journal_id": "",  # filled after bulk insert
+                                "publisher": _apc_e.get("publisher", ""),
+                                "apc_value": _apc_e.get("apc_value", ""),
+                                "apc_currency": _apc_e.get("apc_currency", ""),
+                                "apc_mode_raw": _apc_e.get("mode_raw", ""),
+                                "apc_mode_normalized": _apc_e.get("mode_normalized", ""),
+                                "has_gpoa_discount": _apc_e.get("has_gpoa_discount", False),
+                                "original_apc_value": _apc_e.get("original_apc_value", _apc_e.get("apc_value", "")),
+                                "discounted_apc_value": _apc_e.get("discounted_apc_value", _apc_e.get("apc_value", "")),
+                                "discount_percent": _apc_e.get("discount_percent", 0),
+                                "is_highlighted": _apc_e.get("is_highlighted", False),
+                                "source_file": "bulk",
+                            })
+                    # Track for duplicate ISSN within same run
+                    for norm in (norm_p, norm_e):
+                        if norm and norm != "no data":
+                            new_issn_map[norm] = len(to_insert_journals) - 1  # index into list
+                    db_stats["new_records"] += 1
             else:
                 jid = existing["id"]
                 # Recompute old hash from bulk-fetched child data (catches manual DB edits)
@@ -889,7 +905,11 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 old_hash_computed = compute_data_hash(old_hash_input)
 
                 if old_hash_computed == new_hash:
-                    # Case B: Unchanged
+                    # Case B: Unchanged against production
+                    to_touch_ids.append(jid)
+                    db_stats["unchanged_records"] += 1
+                elif validate and jid in pending_proposals_map and pending_proposals_map[jid].get("data_hash") == new_hash:
+                    # Case B2: Validation mode — pending proposal already exists with identical data hash!
                     to_touch_ids.append(jid)
                     db_stats["unchanged_records"] += 1
                 else:
@@ -1303,7 +1323,15 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
     print(f"SCImago stage time          : {scimago_duration:.2f} sec")
     if use_db:
         print(f"DB persistence time       : {db_duration:.2f} sec")
-    print(f"TOTAL PIPELINE TIME         : {total_pipeline_time:.2f} sec ({round(total_pipeline_time / 60.0, 2)} min)")
+    # Export legacy Excel artifact expected by GitHub Actions cron workflow
+    try:
+        os.makedirs("output", exist_ok=True)
+        excel_out_path = os.path.join("output", "cfr_scopus_mjl_scimago_results.xlsx")
+        pd.DataFrame(results).to_excel(excel_out_path, index=False)
+        print(f"[INFO] Exported pipeline results to Excel artifact: {excel_out_path}", flush=True)
+    except Exception as e:
+        print(f"[WARNING] Could not export Excel artifact: {e}", flush=True)
+
     print("========================================\n")
     if use_db and pipeline_run_id:
         print(f"[SUCCESS] Pipeline run {pipeline_run_id} persisted to Supabase")

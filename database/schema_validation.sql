@@ -58,6 +58,10 @@ CREATE INDEX IF NOT EXISTS change_proposals_pipeline_run_id_idx ON change_propos
 CREATE INDEX IF NOT EXISTS change_proposals_journal_id_idx ON change_proposals(journal_id);
 CREATE INDEX IF NOT EXISTS change_proposals_status_idx ON change_proposals(status);
 CREATE INDEX IF NOT EXISTS change_proposals_change_type_idx ON change_proposals(change_type);
+-- Unique index enforcing max 1 PENDING proposal per existing journal
+CREATE UNIQUE INDEX IF NOT EXISTS change_proposals_pending_journal_idx ON change_proposals(journal_id) WHERE status = 'PENDING' AND journal_id IS NOT NULL;
+-- Unique index enforcing max 1 PENDING proposal per new journal (sl_no)
+CREATE UNIQUE INDEX IF NOT EXISTS change_proposals_pending_new_sl_no_idx ON change_proposals(sl_no) WHERE status = 'PENDING' AND change_type = 'NEW' AND sl_no IS NOT NULL;
 
 -- -------------------------------------------------------------------
 -- 3. Optionally track journals that disappeared from CFR source
