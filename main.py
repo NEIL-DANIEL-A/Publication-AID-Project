@@ -847,6 +847,16 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                 old_apc = apc_map.get(jid, [])
                 old_apc_aggregate = _compute_apc_aggregate(old_apc)
                 old_apc_mode_aggregate = _compute_apc_mode_aggregate(old_apc)
+                if old_apc:
+                    _old_has_gpoa = str(any(a.get("has_gpoa_discount") for a in old_apc))
+                    _old_orig = str(old_apc[0].get("original_apc_value", old_apc[0].get("apc_value","")))
+                    _old_disc = str(old_apc[0].get("discounted_apc_value", old_apc[0].get("apc_value","")))
+                    _old_pct = str(old_apc[0].get("discount_percent", 0))
+                else:
+                    _old_has_gpoa = ""
+                    _old_orig = ""
+                    _old_disc = ""
+                    _old_pct = ""
                 # Normalize ISSN for old hash as well to match new hash normalization
                 _old_hash_print = _n2(existing.get("print_issn", ""))
                 _old_hash_e = _n2(existing.get("e_issn", ""))
@@ -886,6 +896,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                     scimago_url=old_scimago.get("url", ""),
                     apc_aggregate=old_apc_aggregate,
                     apc_mode_aggregate=old_apc_mode_aggregate,
+                    has_gpoa_discount=_old_has_gpoa,
+                    original_apc_value=_old_orig,
+                    discounted_apc_value=_old_disc,
+                    discount_percent=_old_pct,
                 )
                 old_hash_computed = compute_data_hash(old_hash_input)
 
