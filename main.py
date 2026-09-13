@@ -629,8 +629,11 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                 cur = _normalize_value(e.get("apc_currency", ""))
                 val = _normalize_value(e.get("apc_value", ""))
                 gpoa = _normalize_value(e.get("has_gpoa_discount", False))
-                orig = _normalize_value(e.get("original_apc_value", ""))
-                disc = _normalize_value(e.get("discounted_apc_value", ""))
+                # Fallback original/discounted to apc_value if missing/empty (matches DB upsert logic)
+                _orig_raw = e.get("original_apc_value") or e.get("apc_value", "")
+                _disc_raw = e.get("discounted_apc_value") or e.get("apc_value", "")
+                orig = _normalize_value(_orig_raw)
+                disc = _normalize_value(_disc_raw)
                 parts.append(f"{pub}:{cur}:{val}:gpoa={gpoa}:orig={orig}:disc={disc}")
             return "|".join(parts)
 
