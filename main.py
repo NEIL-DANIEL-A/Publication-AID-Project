@@ -205,16 +205,11 @@ def run_source_only():
     return journals
 
 
-def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: bool = False):
+def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     """
     Complete pipeline:
     CFR collection -> Scopus Verification -> MJL Verification (hybrid) -> SCImago lookup -> Consolidated Excel.
     Filtering: Only Scopus Active / Indexed journals proceed to MJL and SCImago.
-
-    If validate=True, NEW/MODIFIED/REMOVED journals are NOT written directly to
-    production tables. Instead they are written to change_proposals with
-    status PENDING for admin approval (Validation & Approval Layer).
-    UNCHANGED journals are still touched.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     pipeline_start = time.perf_counter()
@@ -429,6 +424,11 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
         apc_value_val = apc_res.get("apc_value", "no data") if apc_res else "no data"
         apc_currency_val = apc_res.get("apc_currency", "no data") if apc_res else "no data"
         apc_mode_val = apc_res.get("mode_raw", "no data") if apc_res else "no data"
+        has_gpoa_val = apc_res.get("has_gpoa_discount", False) if apc_res else False
+        orig_apc_val = apc_res.get("original_apc_value", "") if apc_res else ""
+        disc_apc_val = apc_res.get("discounted_apc_value", "") if apc_res else ""
+        disc_pct_val = apc_res.get("discount_percent", 0) if apc_res else 0
+        is_highlighted_val = apc_res.get("is_highlighted", False) if apc_res else False
 
         record = {
             "Sl.No": j.sl_no,
@@ -460,6 +460,11 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             "APC Value": apc_value_val,
             "APC Currency": apc_currency_val,
             "APC Mode": apc_mode_val,
+            "Has GPOA Discount": has_gpoa_val,
+            "Original APC Value": orig_apc_val,
+            "Discounted APC Value": disc_apc_val,
+            "Discount Percent": disc_pct_val,
+            "Is Highlighted": is_highlighted_val,
         }
 
         return idx, record, is_success, j_time, j.journal_title, s_res.scopus_status, sjr_val, q_val, status_display
@@ -529,6 +534,11 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             "APC Value": "no data",
             "APC Currency": "no data",
             "APC Mode": "no data",
+            "Has GPOA Discount": False,
+            "Original APC Value": "",
+            "Discounted APC Value": "",
+            "Discount Percent": 0,
+            "Is Highlighted": False,
         })
 
     # ------------------------------------------------------------------ #
@@ -585,7 +595,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             scimago_map = bulk_get_child_map("scimago_results", journal_ids)
             apc_map = bulk_get_apc_map(journal_ids)
             phase1_time = time.perf_counter() - phase1_start
-            print(f"[INFO] DB PHASE 1: Loaded {unique_journals} journals + {len(cfr_map)} cfr + {len(scopus_map)} scopus + {len(mjl_map)} mjl + {len(scimago_map)} scimago + {len(apc_map)} apc in {phase1_time:.2f}s (6 queries)", flush=True)
+            print(f"[INFO] DB PHASE 1: Loaded {unique_journals} journals + {len(cfr_map)} cfr + {len(scopus_map)} scopus + {len(mjl_map)} mjl + {len(scimago_map)} scimago + {len(apc_map)} apc in {phase1_time:.2f}s", flush=True)
         except Exception as e:
             print(f"[WARNING] Bulk fetch failed, falling back to per-journal lookup: {e}")
             journals_map = {}
@@ -618,7 +628,13 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 pub = _normalize_value(e.get("publisher", ""))
                 cur = _normalize_value(e.get("apc_currency", ""))
                 val = _normalize_value(e.get("apc_value", ""))
-                parts.append(f"{pub}:{cur}:{val}")
+                gpoa = _normalize_value(e.get("has_gpoa_discount", False))
+                # Fallback original/discounted to apc_value if missing/empty (matches DB upsert logic)
+                _orig_raw = e.get("original_apc_value") or e.get("apc_value", "")
+                _disc_raw = e.get("discounted_apc_value") or e.get("apc_value", "")
+                orig = _normalize_value(_orig_raw)
+                disc = _normalize_value(_disc_raw)
+                parts.append(f"{pub}:{cur}:{val}:gpoa={gpoa}:orig={orig}:disc={disc}")
             return "|".join(parts)
 
         def _compute_apc_mode_aggregate(apc_entries: List[dict]) -> str:
@@ -662,23 +678,35 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             # Compute new hash
             _mjl_match_for_hash = "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped", "no data") else "Print ISSN" if rec["MJL Matched ISSN"] not in ("no data", "skipped", "") else "No Match"
 
-            # Compute APC aggregates for hash
-            _apc_val = rec.get("APC Value", "no data")
-            _apc_cur = rec.get("APC Currency", "no data")
-            _apc_mode = rec.get("APC Mode", "no data")
-            _apc_for_hash = ""
-            _apc_mode_for_hash = ""
-            if _apc_val not in ("no data", "", "N/A"):
-                # Use APC lookup's publisher (not CFR publisher) to match _compute_apc_aggregate
-                _apc_entry = apc_lookup.get(rec["Sl.No"])
-                _apc_pub = _apc_entry.get("publisher", "") if _apc_entry else ""
-                _apc_for_hash = f"{_normalize_value(_apc_pub)}:{_normalize_value(_apc_cur)}:{_normalize_value(_apc_val)}"
-                _apc_mode_for_hash = _normalize_value(_apc_mode) if _apc_mode not in ("no data", "", "N/A") else ""
+            # Compute APC aggregates for hash - use same helpers as old-hash path for consistency (handles 1:many e.g. SAGE USD+GBP)
+            _apc_entries_for_hash = apc_lookup.get(rec["Sl.No"], [])
+            if isinstance(_apc_entries_for_hash, dict):
+                _apc_entries_for_hash = [_apc_entries_for_hash]
+            _apc_for_hash = _compute_apc_aggregate(_apc_entries_for_hash) if _apc_entries_for_hash else ""
+            _apc_mode_for_hash = _compute_apc_mode_aggregate(_apc_entries_for_hash) if _apc_entries_for_hash else ""
+            # has_gpoa/original/discounted derived from same entries (any/first) to match _compute_apc_aggregate logic
+            if _apc_entries_for_hash:
+                _has_gpoa_hash = str(any(e.get("has_gpoa_discount") for e in _apc_entries_for_hash))
+                _orig_apc_hash = str(_apc_entries_for_hash[0].get("original_apc_value", _apc_entries_for_hash[0].get("apc_value","")))
+                _disc_apc_hash = str(_apc_entries_for_hash[0].get("discounted_apc_value", _apc_entries_for_hash[0].get("apc_value","")))
+                _disc_pct_hash = str(_apc_entries_for_hash[0].get("discount_percent", 0))
+            else:
+                _has_gpoa_hash = ""
+                _orig_apc_hash = ""
+                _disc_apc_hash = ""
+                _disc_pct_hash = ""
 
+            # Normalize ISSN for hashing so hyphen variations don't create false changes; use _n2 helper
+            _hash_print = _n2(rec["Print-ISSN"])
+            _hash_e = _n2(rec["E-ISSN"])
+            if _hash_print == "no data":
+                _hash_print = ""
+            if _hash_e == "no data":
+                _hash_e = ""
             hash_input = build_hash_input(
                 journal_title=rec["Full Journal Title"],
-                print_issn=rec["Print-ISSN"],
-                e_issn=rec["E-ISSN"],
+                print_issn=_hash_print,
+                e_issn=_hash_e,
                 publisher=rec["Publisher"],
                 country=rec["Country"],
                 cfr_sl_no=rec["Sl.No"],
@@ -688,10 +716,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 scopus_sourcerecord_id=rec["Scopus Source Record ID"],
                 scopus_publisher=rec["Scopus Publisher"],
                 scopus_coverage=rec["Scopus Coverage"],
-                scopus_issn="",
-                scopus_eissn="",
-                scopus_raw_active="",
-                scopus_raw_discontinued="",
+                scopus_issn=rec.get("Scopus ISSN", ""),
+                scopus_eissn=rec.get("Scopus EISSN", ""),
+                scopus_raw_active=rec.get("Scopus Raw Active", ""),
+                scopus_raw_discontinued=rec.get("Scopus Raw Discontinued", ""),
                 mjl_status=rec["MJL Status"],
                 mjl_index=rec["MJL Index"],
                 mjl_issn_used=rec["MJL Matched ISSN"],
@@ -707,6 +735,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 scimago_url=rec["SCImago URL"],
                 apc_aggregate=_apc_for_hash,
                 apc_mode_aggregate=_apc_mode_for_hash,
+                has_gpoa_discount=_has_gpoa_hash,
+                original_apc_value=_orig_apc_hash,
+                discounted_apc_value=_disc_apc_hash,
+                discount_percent=_disc_pct_hash,
             )
             new_hash = compute_data_hash(hash_input)
 
@@ -738,10 +770,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 "source_title": rec["Scopus Source Title"],
                 "scopus_publisher": rec["Scopus Publisher"],
                 "scopus_coverage": rec["Scopus Coverage"],
-                "scopus_issn": "",
-                "scopus_eissn": "",
-                "raw_active_status": "",
-                "raw_discontinued_flag": "",
+                "scopus_issn": rec.get("Scopus ISSN", ""),
+                "scopus_eissn": rec.get("Scopus EISSN", ""),
+                "raw_active_status": rec.get("Scopus Raw Active", ""),
+                "raw_discontinued_flag": rec.get("Scopus Raw Discontinued", ""),
             }
             mjl_exec = rec.get("MJL Execution Time (sec)", "no data")
             try:
@@ -804,10 +836,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                             "source_file": "bulk",
                         })
                 # Track for duplicate ISSN within same run
-                for norm in (norm_p, norm_e):
-                    if norm and norm != "no data":
-                        new_issn_map[norm] = len(to_insert_journals) - 1  # index into list
-                db_stats["new_records"] += 1
+                    for norm in (norm_p, norm_e):
+                        if norm and norm != "no data":
+                            new_issn_map[norm] = len(to_insert_journals) - 1  # index into list
+                    db_stats["new_records"] += 1
             else:
                 jid = existing["id"]
                 # Recompute old hash from bulk-fetched child data (catches manual DB edits)
@@ -818,10 +850,27 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                 old_apc = apc_map.get(jid, [])
                 old_apc_aggregate = _compute_apc_aggregate(old_apc)
                 old_apc_mode_aggregate = _compute_apc_mode_aggregate(old_apc)
+                if old_apc:
+                    _old_has_gpoa = str(any(a.get("has_gpoa_discount") for a in old_apc))
+                    _old_orig = str(old_apc[0].get("original_apc_value", old_apc[0].get("apc_value","")))
+                    _old_disc = str(old_apc[0].get("discounted_apc_value", old_apc[0].get("apc_value","")))
+                    _old_pct = str(old_apc[0].get("discount_percent", 0))
+                else:
+                    _old_has_gpoa = ""
+                    _old_orig = ""
+                    _old_disc = ""
+                    _old_pct = ""
+                # Normalize ISSN for old hash as well to match new hash normalization
+                _old_hash_print = _n2(existing.get("print_issn", ""))
+                _old_hash_e = _n2(existing.get("e_issn", ""))
+                if _old_hash_print == "no data":
+                    _old_hash_print = ""
+                if _old_hash_e == "no data":
+                    _old_hash_e = ""
                 old_hash_input = build_hash_input(
                     journal_title=existing.get("title", ""),
-                    print_issn=existing.get("print_issn", ""),
-                    e_issn=existing.get("e_issn", ""),
+                    print_issn=_old_hash_print,
+                    e_issn=_old_hash_e,
                     publisher=existing.get("publisher", ""),
                     country=existing.get("country", ""),
                     cfr_sl_no=old_cfr.get("sl_no", ""),
@@ -850,23 +899,38 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                     scimago_url=old_scimago.get("url", ""),
                     apc_aggregate=old_apc_aggregate,
                     apc_mode_aggregate=old_apc_mode_aggregate,
+                    has_gpoa_discount=_old_has_gpoa,
+                    original_apc_value=_old_orig,
+                    discounted_apc_value=_old_disc,
+                    discount_percent=_old_pct,
                 )
                 old_hash_computed = compute_data_hash(old_hash_input)
 
                 if old_hash_computed == new_hash:
-                    # Case B: Unchanged
+                    # Case B: Unchanged against production
                     to_touch_ids.append(jid)
                     db_stats["unchanged_records"] += 1
                 else:
                     # Case C: Changed - field-level diff
                     changes = []
-                    for field, new_v in [("title", rec["Full Journal Title"]), ("publisher", rec["Publisher"]), ("country", rec["Country"])]:
+                    for field, new_v in [("title", rec["Full Journal Title"]), ("publisher", rec["Publisher"]), ("country", rec["Country"]), ("print_issn", rec["Print-ISSN"]), ("e_issn", rec["E-ISSN"])]:
                         old_v = existing.get(field, "")
-                        if _normalize_value(old_v) != _normalize_value(new_v):
+                        if field in ("print_issn", "e_issn"):
+                            if _normalize_value(_n2(old_v)) != _normalize_value(_n2(new_v)):
+                                changes.append(("journal", field, old_v, new_v))
+                        elif _normalize_value(old_v) != _normalize_value(new_v):
                             changes.append(("journal", field, old_v, new_v))
                     cfr_old_sl = old_cfr.get("sl_no", "")
                     if _normalize_value(cfr_old_sl) != _normalize_value(rec["Sl.No"]):
                         changes.append(("cfr", "sl_no", cfr_old_sl, rec["Sl.No"]))
+                    # CFR ISSN/title/publisher/country tracked explicitly
+                    for f, new_v in [("print_issn", rec["Print-ISSN"]), ("e_issn", rec["E-ISSN"]), ("journal_title", rec["Full Journal Title"]), ("publisher", rec["Publisher"]), ("country", rec["Country"])]:
+                        old_v = old_cfr.get(f, "")
+                        if f in ("print_issn", "e_issn"):
+                            if _normalize_value(_n2(old_v)) != _normalize_value(_n2(new_v)):
+                                changes.append(("cfr", f, old_v, new_v))
+                        elif _normalize_value(old_v) != _normalize_value(new_v):
+                            changes.append(("cfr", f, old_v, new_v))
                     for f, new_v in [
                         ("scopus_status", rec["Scopus Indexing Status"]),
                         ("match_type", rec["Scopus Match Type"]),
@@ -874,6 +938,10 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                         ("sourcerecord_id", rec["Scopus Source Record ID"]),
                         ("scopus_publisher", rec["Scopus Publisher"]),
                         ("scopus_coverage", rec["Scopus Coverage"]),
+                        ("scopus_issn", rec.get("Scopus ISSN", "")),
+                        ("scopus_eissn", rec.get("Scopus EISSN", "")),
+                        ("raw_active_status", rec.get("Scopus Raw Active", "")),
+                        ("raw_discontinued_flag", rec.get("Scopus Raw Discontinued", "")),
                     ]:
                         old_v = old_scopus.get(f, "")
                         if _normalize_value(old_v) != _normalize_value(new_v):
@@ -892,6 +960,40 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
                         old_v = old_scimago.get(f, "")
                         if _normalize_value(old_v) != _normalize_value(new_v):
                             changes.append(("scimago", f, old_v, new_v))
+                    # APC comparison (1:many - keyed by publisher, not index)
+                    old_apc_list = apc_map.get(jid, [])
+                    _apc_entries = apc_lookup.get(rec["Sl.No"], [])
+                    new_apc_list = [_apc_entries] if isinstance(_apc_entries, dict) else list(_apc_entries) if _apc_entries else []
+                    if old_apc_list or new_apc_list:
+                        def _apc_key(a):
+                            return _normalize_value(a.get("publisher", ""))
+                        def _mode(a):
+                            # apc_results uses apc_mode_normalized, apc_lookup uses mode_normalized
+                            return a.get("apc_mode_normalized", a.get("mode_normalized", ""))
+                        old_by_pub = {_apc_key(a): a for a in old_apc_list if _apc_key(a)}
+                        new_by_pub = {_apc_key(a): a for a in new_apc_list if _apc_key(a)}
+                        all_pubs = set(old_by_pub.keys()) | set(new_by_pub.keys())
+                        for pub in sorted(all_pubs):
+                            old_a = old_by_pub.get(pub, {})
+                            new_a = new_by_pub.get(pub, {})
+                            for field, o_val, n_val in [
+                                ("apc_value", old_a.get("apc_value", ""), new_a.get("apc_value", "")),
+                                ("apc_currency", old_a.get("apc_currency", ""), new_a.get("apc_currency", "")),
+                                ("apc_mode_normalized", old_a.get("apc_mode_normalized", ""), _mode(new_a)),
+                                ("has_gpoa_discount", str(old_a.get("has_gpoa_discount", False)), str(new_a.get("has_gpoa_discount", False))),
+                                ("original_apc_value", old_a.get("original_apc_value", ""), new_a.get("original_apc_value", new_a.get("apc_value", ""))),
+                                ("discounted_apc_value", old_a.get("discounted_apc_value", ""), new_a.get("discounted_apc_value", new_a.get("apc_value", ""))),
+                                ("discount_percent", str(old_a.get("discount_percent", 0)), str(new_a.get("discount_percent", 0))),
+                            ]:
+                                if _normalize_value(o_val) != _normalize_value(n_val):
+                                    changes.append(("apc", f"{pub}.{field}", o_val, n_val))
+                    if not changes and old_hash_computed != new_hash and len([c for c in changes if c[0]=="journal" and c[1]=="data_hash"]) == 0:
+                        # Debug first 3 hash-only mismatches to pinpoint volatile field
+                        if sum(1 for c in all_changes if c["source"]=="journal" and c["field_name"]=="data_hash") < 3:
+                            print(f"[DEBUG HASH MISMATCH] {rec['Full Journal Title'][:35]:35} jid={jid[:8]} old={old_hash_computed[:12]} new={new_hash[:12]}", flush=True)
+                            print(f"  old_apc_agg={old_apc_aggregate[:120]}", flush=True)
+                            print(f"  new_apc_agg={_apc_for_hash[:120]}", flush=True)
+                            print(f"  old_mode={old_apc_mode_aggregate} new_mode={_apc_mode_for_hash} old_gpoa={old_hash_input.get('has_gpoa_discount')} new_gpoa={_has_gpoa_hash}", flush=True)
                     if not changes:
                         changes.append(("journal", "data_hash", old_hash_computed, new_hash))
 
@@ -941,263 +1043,122 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
         print(f"[INFO] DB PHASE 2: Classified {db_stats['new_records']} new | {db_stats['updated_records']} updated | {db_stats['unchanged_records']} unchanged in {phase2_time:.3f}s (0 queries)", flush=True)
 
         # ----------------------------------------------------------------
-        # PHASE 3: Bulk WRITE or VALIDATION (Validation & Approval Layer)
-        #   validate=False → direct production write (legacy)
-        #   validate=True  → write to change_proposals with PENDING status;
-        #                    production untouched until admin approval.
         # ----------------------------------------------------------------
-        if validate:
-            print(f"[INFO] DB PHASE 3: Validation mode — creating change proposals (production NOT modified)...", flush=True)
-        else:
-            print(f"[INFO] DB PHASE 3: Bulk writing to Supabase...", flush=True)
+        # PHASE 3: Bulk write to production
+        # ----------------------------------------------------------------
+        print(f"[INFO] DB PHASE 3: Bulk writing to Supabase...", flush=True)
         phase3_start = time.perf_counter()
 
-        # Detect POTENTIALLY REMOVED journals: in production but not seen in CFR run
-        _seen_ids = set(to_touch_ids) | set(j.get("id") for j in to_update_journals)  # updated ids
-        # to_insert are NEW, no id yet. Collect existing ids seen via _lookup_existing loop:
-        # Build seen set from to_touch + to_update + journals_map ids that were matched as existing
-        # Simpler: all journal_ids minus those touched/updated and minus newly inserted later
-        _all_existing_ids = set(journal_ids) if 'journal_ids' in locals() else set()
-        _removed_ids = _all_existing_ids - _seen_ids
-        # Remove ids that were actually updated/touched in this run comparison — they are in _seen_ids
-        # Also exclude ids that correspond to NEW journals (no existing id)
-        _removed_proposals = []
-        if _removed_ids:
-            # Limit display; full list may be large on first run if CFR source truncated
-            print(f"[INFO] Detected {len(_removed_ids)} potentially REMOVED journals (in DB but not in CFR this run)", flush=True)
-            for rid in list(_removed_ids)[:200]:  # cap proposals at 200 to avoid spam on source outage
-                old_j = next((v for v in journals_map.values() if v.get("id") == rid), None)
-                if old_j:
-                    _removed_proposals.append({
-                        "journal_id": rid,
-                        "sl_no": old_j.get("sl_no", ""),
-                        "old_data": {"journal": old_j, "cfr": cfr_map.get(rid, {}), "scopus": scopus_map.get(rid, {}), "mjl": mjl_map.get(rid, {}), "scimago": scimago_map.get(rid, {}), "apc": apc_map.get(rid, [])},
-                        "new_data": None,
-                    })
-
-        # 1. Bulk insert NEW journals (get IDs back for child tables) — or create proposals
+        # ---------- DIRECT MODE (legacy): write straight to production ----------
         new_ids = []
-        if validate and (to_insert_journals or to_update_journals or _removed_proposals):
-            # ---------- VALIDATION MODE: create proposals, do NOT touch production ----------
-            print(f"[INFO] Validation mode: {len(to_insert_journals)} NEW | {len(to_update_journals)} MODIFIED | {len(_removed_proposals)} REMOVED proposals pending approval", flush=True)
-            # UNCHANGED still touched (no approval needed)
-            if to_touch_ids:
-                print(f"  [VALIDATION] Touching {len(to_touch_ids)} unchanged journals (no approval needed)...", flush=True)
-                bulk_touch_journals(to_touch_ids, pipeline_run_id or "")
-            # Build proposals
-            proposals = []
-            # Group diffs by journal id for MODIFIED
-            from collections import defaultdict as _dd
-            diffs_by_jid = _dd(list)
-            for ch in all_changes:
-                diffs_by_jid[ch["journal_id"]].append({"source": ch["source"], "field": ch["field_name"], "old_value": ch["old_value"], "new_value": ch["new_value"]})
-            # NEW proposals
-            for i, jr in enumerate(to_insert_journals):
-                # Collect APC for this sl_no
-                sl = to_insert_cfr[i].get("sl_no", "") if i < len(to_insert_cfr) else ""
-                apc_for_sl = [r for r in to_upsert_apc if r.get("publisher") and sl in apc_lookup and apc_lookup.get(sl, {}).get("publisher") == r.get("publisher")]
-                # Fallback: all apc with placeholder "" will be handled via sl_no scan
-                if not apc_for_sl:
-                    entry = apc_lookup.get(sl)
-                    if entry:
-                        lst = [entry] if isinstance(entry, dict) else entry
-                        apc_for_sl = [{"publisher": e.get("publisher",""), "apc_value": e.get("apc_value",""), "apc_currency": e.get("apc_currency",""), "apc_mode_raw": e.get("mode_raw",""), "apc_mode_normalized": e.get("mode_normalized",""), "has_gpoa_discount": e.get("has_gpoa_discount", False), "original_apc_value": e.get("original_apc_value", e.get("apc_value","")), "discounted_apc_value": e.get("discounted_apc_value", e.get("apc_value","")), "discount_percent": e.get("discount_percent", 0), "is_highlighted": e.get("is_highlighted", False), "source_file": "bulk"} for e in lst]
-                proposals.append({
-                    "journal_id": None,
-                    "sl_no": sl,
-                    "change_type": "NEW",
-                    "status": "PENDING",
-                    "old_data": None,
-                    "new_data": {"journal": jr, "cfr": to_insert_cfr[i] if i < len(to_insert_cfr) else {}, "scopus": to_insert_scopus[i] if i < len(to_insert_scopus) else {}, "mjl": to_insert_mjl[i] if i < len(to_insert_mjl) else {}, "scimago": to_insert_scimago[i] if i < len(to_insert_scimago) else {}, "apc": apc_for_sl},
-                    "diff_summary": [],
-                    "journal_payload": jr,
-                    "cfr_payload": to_insert_cfr[i] if i < len(to_insert_cfr) else {},
-                    "scopus_payload": to_insert_scopus[i] if i < len(to_insert_scopus) else {},
-                    "mjl_payload": to_insert_mjl[i] if i < len(to_insert_mjl) else {},
-                    "scimago_payload": to_insert_scimago[i] if i < len(to_insert_scimago) else {},
-                    "apc_payload": apc_for_sl,
-                    "data_hash": jr.get("data_hash", ""),
+        if to_insert_journals:
+            # Deduplicate by normalized_print ISSN to avoid constraint violations
+            seen_print = set()
+            dedup_journals = []
+            dedup_cfr = []
+            dedup_scopus = []
+            dedup_mjl = []
+            dedup_scimago = []
+            for i, j in enumerate(to_insert_journals):
+                np = j.get("normalized_print", "")
+                if np and np != "no data" and np in seen_print:
+                    continue
+                if np and np != "no data":
+                    seen_print.add(np)
+                dedup_journals.append(j)
+                dedup_cfr.append(to_insert_cfr[i])
+                dedup_scopus.append(to_insert_scopus[i])
+                dedup_mjl.append(to_insert_mjl[i])
+                dedup_scimago.append(to_insert_scimago[i])
+            if len(dedup_journals) < len(to_insert_journals):
+                print(f"  [DEDUP] Removed {len(to_insert_journals) - len(dedup_journals)} duplicate ISSN journals", flush=True)
+            to_insert_journals = dedup_journals
+            to_insert_cfr = dedup_cfr
+            to_insert_scopus = dedup_scopus
+            to_insert_mjl = dedup_mjl
+            to_insert_scimago = dedup_scimago
+
+            print(f"  [WRITE] Inserting {len(to_insert_journals)} new journals...", flush=True)
+            inserted = bulk_insert_journals(to_insert_journals)
+            new_ids = [r["id"] for r in inserted]
+            # Assign journal_id to child rows
+            for i, jid in enumerate(new_ids):
+                to_insert_cfr[i]["journal_id"] = jid
+                to_insert_scopus[i]["journal_id"] = jid
+                to_insert_mjl[i]["journal_id"] = jid
+                to_insert_scimago[i]["journal_id"] = jid
+            # Update new_issn_map with real IDs
+            for i, jid in enumerate(new_ids):
+                norm_p_i = to_insert_journals[i].get("normalized_print", "")
+                norm_e_i = to_insert_journals[i].get("normalized_e", "")
+                if norm_p_i and norm_p_i != "no data":
+                    new_issn_map[norm_p_i] = jid
+                if norm_e_i and norm_e_i != "no data":
+                    new_issn_map[norm_e_i] = jid
+
+        # 2-5. Bulk upsert child tables for NEW journals
+        bulk_upsert_child("cfr_results", to_insert_cfr)
+        bulk_upsert_child("scopus_results", to_insert_scopus)
+        bulk_upsert_child("mjl_results", to_insert_mjl)
+        bulk_upsert_child("scimago_results", to_insert_scimago)
+
+        # 6. Bulk upsert APC rows for NEW journals (assign journal_id from new_ids)
+        if to_upsert_apc:
+            apc_idx = 0
+            for i, jid in enumerate(new_ids):
+                _sl_no = to_insert_cfr[i].get("sl_no", "")
+                _has_apc = _sl_no in apc_lookup
+                if _has_apc and apc_idx < len(to_upsert_apc):
+                    to_upsert_apc[apc_idx]["journal_id"] = jid
+                    apc_idx += 1
+            bulk_upsert_apc(to_upsert_apc)
+
+        # 7. Bulk update CHANGED journals
+        if to_update_journals:
+            print(f"  [WRITE] Updating {len(to_update_journals)} changed journals...", flush=True)
+            bulk_update_journals(to_update_journals)
+
+        # 8-11. Bulk upsert child tables for CHANGED journals
+        bulk_upsert_child("cfr_results", to_update_cfr)
+        bulk_upsert_child("scopus_results", to_update_scopus)
+        bulk_upsert_child("mjl_results", to_update_mjl)
+        bulk_upsert_child("scimago_results", to_update_scimago)
+
+        # 13. Bulk touch UNCHANGED journals (1 query)
+        if to_touch_ids:
+            print(f"  [WRITE] Touching {len(to_touch_ids)} unchanged journals...", flush=True)
+            bulk_touch_journals(to_touch_ids, pipeline_run_id or "")
+
+        # 14. Bulk insert CHANGES
+        if all_changes:
+            print(f"  [WRITE] Inserting {len(all_changes)} change records...", flush=True)
+            bulk_insert_changes(all_changes)
+
+        # Log updated field summaries
+        if db_stats["updated_records"] > 0:
+            field_counts = collections.Counter(c["source"] for c in all_changes)
+            print(f"  [UPDATED] Field changes: {dict(field_counts)}", flush=True)
+
+        phase3_time = time.perf_counter() - phase3_start
+        db_duration = round(phase1_time + phase2_time + phase3_time, 2)
+        print(f"[INFO] DB PHASE 3: Bulk write complete in {phase3_time:.2f}s", flush=True)
+        print(f"[INFO] DB persistence complete: {db_stats['new_records']} new | {db_stats['updated_records']} updated | {db_stats['unchanged_records']} unchanged | {db_stats['failed_records']} failed in {db_duration:.2f}s (was ~62s)", flush=True)
+        # Finish pipeline_run
+        if pipeline_run_id:
+            try:
+                total_duration = round(time.perf_counter() - pipeline_start, 2)
+                finish_pipeline_run(pipeline_run_id, "success", total_duration, {
+                    "total_cfr": len(journals),
+                    "total_scopus_active": scopus_stats.get("active_indexed", 0),
+                    "total_mjl_processed": len(eligible_pairs),
+                    "total_scimago_processed": len(eligible_pairs),
+                    "new_records": db_stats["new_records"],
+                    "updated_records": db_stats["updated_records"],
+                    "unchanged_records": db_stats["unchanged_records"],
+                    "failed_records": db_stats["failed_records"],
                 })
-            # MODIFIED proposals
-            for idx, jr in enumerate(to_update_journals):
-                jid = jr.get("id")
-                proposals.append({
-                    "journal_id": jid,
-                    "sl_no": to_update_cfr[idx].get("sl_no", "") if idx < len(to_update_cfr) else "",
-                    "change_type": "MODIFIED",
-                    "status": "PENDING",
-                    "old_data": {"journal": next((v for v in journals_map.values() if v.get("id")==jid), {}), "cfr": cfr_map.get(jid, {}), "scopus": scopus_map.get(jid, {}), "mjl": mjl_map.get(jid, {}), "scimago": scimago_map.get(jid, {}), "apc": apc_map.get(jid, [])},
-                    "new_data": {"journal": {k:v for k,v in jr.items() if k!="id"}, "cfr": to_update_cfr[idx] if idx < len(to_update_cfr) else {}, "scopus": to_update_scopus[idx] if idx < len(to_update_scopus) else {}, "mjl": to_update_mjl[idx] if idx < len(to_update_mjl) else {}, "scimago": to_update_scimago[idx] if idx < len(to_update_scimago) else {}, "apc": [r for r in to_upsert_apc if r.get("journal_id")==jid]},
-                    "diff_summary": diffs_by_jid.get(jid, []),
-                    "journal_payload": {k:v for k,v in jr.items() if k!="id"},
-                    "cfr_payload": to_update_cfr[idx] if idx < len(to_update_cfr) else {},
-                    "scopus_payload": to_update_scopus[idx] if idx < len(to_update_scopus) else {},
-                    "mjl_payload": to_update_mjl[idx] if idx < len(to_update_mjl) else {},
-                    "scimago_payload": to_update_scimago[idx] if idx < len(to_update_scimago) else {},
-                    "apc_payload": [r for r in to_upsert_apc if r.get("journal_id")==jid],
-                    "data_hash": jr.get("data_hash", ""),
-                })
-            # REMOVED proposals
-            for rem in _removed_proposals:
-                proposals.append({
-                    "journal_id": rem["journal_id"],
-                    "sl_no": rem["sl_no"],
-                    "change_type": "REMOVED",
-                    "status": "PENDING",
-                    "old_data": rem["old_data"],
-                    "new_data": None,
-                    "diff_summary": [{"source": "cfr", "field": "removed_from_source", "old_value": rem["sl_no"], "new_value": "Not in CFR this run"}],
-                    "journal_payload": None,
-                    "cfr_payload": None,
-                    "scopus_payload": None,
-                    "mjl_payload": None,
-                    "scimago_payload": None,
-                    "apc_payload": [],
-                    "data_hash": None,
-                })
-            # Bulk insert proposals
-            if proposals:
-                try:
-                    from database.repository import create_change_proposals
-                    create_change_proposals(pipeline_run_id, proposals)
-                    print(f"[SUCCESS] Validation: {len(proposals)} proposals created with status PENDING — awaiting admin approval", flush=True)
-                    print(f"  → Review: SELECT * FROM change_proposals WHERE pipeline_run_id='{pipeline_run_id}' AND status='PENDING'", flush=True)
-                    print(f"  → Approve: python scripts/approve.py --run {pipeline_run_id} --approve-all  (or --proposal <id> --approve)", flush=True)
-                except Exception as e:
-                    print(f"[WARNING] Could not create change proposals (table missing? run schema_validation.sql): {e}", flush=True)
-            phase3_time = time.perf_counter() - phase3_start
-            db_duration = round(phase1_time + phase2_time + phase3_time, 2)
-            print(f"[INFO] DB PHASE 3: Validation proposals complete in {phase3_time:.2f}s (production untouched)", flush=True)
-            print(f"[INFO] DB persistence: {db_stats['new_records']} new | {db_stats['updated_records']} modified | {len(_removed_proposals)} removed | {db_stats['unchanged_records']} unchanged (all pending approval)", flush=True)
-            if pipeline_run_id:
-                try:
-                    total_duration = round(time.perf_counter() - pipeline_start, 2)
-                    # Mark run as pending_review when validation mode
-                    from database.repository import get_supabase_client as _gsc
-                    _gsc().table("pipeline_runs").update({"validation_status": "pending_review", "requires_approval": True}).eq("id", pipeline_run_id).execute()
-                    finish_pipeline_run(pipeline_run_id, "success", total_duration, {
-                        "total_cfr": len(journals),
-                        "total_scopus_active": scopus_stats.get("active_indexed", 0),
-                        "total_mjl_processed": len(eligible_pairs),
-                        "total_scimago_processed": len(eligible_pairs),
-                        "new_records": db_stats["new_records"],
-                        "updated_records": db_stats["updated_records"],
-                        "unchanged_records": db_stats["unchanged_records"],
-                        "failed_records": db_stats["failed_records"],
-                    })
-                except Exception as e:
-                    print(f"[WARNING] Could not finish pipeline_run: {e}")
-
-        elif not validate:
-            # ---------- DIRECT MODE (legacy): write straight to production ----------
-            if to_insert_journals:
-                # Deduplicate by normalized_print ISSN to avoid constraint violations
-                seen_print = set()
-                dedup_journals = []
-                dedup_cfr = []
-                dedup_scopus = []
-                dedup_mjl = []
-                dedup_scimago = []
-                for i, j in enumerate(to_insert_journals):
-                    np = j.get("normalized_print", "")
-                    if np and np != "no data" and np in seen_print:
-                        continue
-                    if np and np != "no data":
-                        seen_print.add(np)
-                    dedup_journals.append(j)
-                    dedup_cfr.append(to_insert_cfr[i])
-                    dedup_scopus.append(to_insert_scopus[i])
-                    dedup_mjl.append(to_insert_mjl[i])
-                    dedup_scimago.append(to_insert_scimago[i])
-                if len(dedup_journals) < len(to_insert_journals):
-                    print(f"  [DEDUP] Removed {len(to_insert_journals) - len(dedup_journals)} duplicate ISSN journals", flush=True)
-                to_insert_journals = dedup_journals
-                to_insert_cfr = dedup_cfr
-                to_insert_scopus = dedup_scopus
-                to_insert_mjl = dedup_mjl
-                to_insert_scimago = dedup_scimago
-
-                print(f"  [WRITE] Inserting {len(to_insert_journals)} new journals...", flush=True)
-                inserted = bulk_insert_journals(to_insert_journals)
-                new_ids = [r["id"] for r in inserted]
-                # Assign journal_id to child rows
-                for i, jid in enumerate(new_ids):
-                    to_insert_cfr[i]["journal_id"] = jid
-                    to_insert_scopus[i]["journal_id"] = jid
-                    to_insert_mjl[i]["journal_id"] = jid
-                    to_insert_scimago[i]["journal_id"] = jid
-                # Update new_issn_map with real IDs
-                for i, jid in enumerate(new_ids):
-                    norm_p_i = to_insert_journals[i].get("normalized_print", "")
-                    norm_e_i = to_insert_journals[i].get("normalized_e", "")
-                    if norm_p_i and norm_p_i != "no data":
-                        new_issn_map[norm_p_i] = jid
-                    if norm_e_i and norm_e_i != "no data":
-                        new_issn_map[norm_e_i] = jid
-
-            # 2-5. Bulk upsert child tables for NEW journals
-            bulk_upsert_child("cfr_results", to_insert_cfr)
-            bulk_upsert_child("scopus_results", to_insert_scopus)
-            bulk_upsert_child("mjl_results", to_insert_mjl)
-            bulk_upsert_child("scimago_results", to_insert_scimago)
-
-            # 6. Bulk upsert APC rows for NEW journals (assign journal_id from new_ids)
-            if to_upsert_apc:
-                apc_idx = 0
-                for i, jid in enumerate(new_ids):
-                    _sl_no = to_insert_cfr[i].get("sl_no", "")
-                    _has_apc = _sl_no in apc_lookup
-                    if _has_apc and apc_idx < len(to_upsert_apc):
-                        to_upsert_apc[apc_idx]["journal_id"] = jid
-                        apc_idx += 1
-                bulk_upsert_apc(to_upsert_apc)
-
-            # 7. Bulk update CHANGED journals
-            if to_update_journals:
-                print(f"  [WRITE] Updating {len(to_update_journals)} changed journals...", flush=True)
-                bulk_update_journals(to_update_journals)
-
-            # 8-11. Bulk upsert child tables for CHANGED journals
-            bulk_upsert_child("cfr_results", to_update_cfr)
-            bulk_upsert_child("scopus_results", to_update_scopus)
-            bulk_upsert_child("mjl_results", to_update_mjl)
-            bulk_upsert_child("scimago_results", to_update_scimago)
-
-            # 13. Bulk touch UNCHANGED journals (1 query)
-            if to_touch_ids:
-                print(f"  [WRITE] Touching {len(to_touch_ids)} unchanged journals...", flush=True)
-                bulk_touch_journals(to_touch_ids, pipeline_run_id or "")
-
-            # 14. Bulk insert CHANGES
-            if all_changes:
-                print(f"  [WRITE] Inserting {len(all_changes)} change records...", flush=True)
-                bulk_insert_changes(all_changes)
-
-            # Log updated field summaries
-            if db_stats["updated_records"] > 0:
-                field_counts = collections.Counter(c["source"] for c in all_changes)
-                print(f"  [UPDATED] Field changes: {dict(field_counts)}", flush=True)
-
-            phase3_time = time.perf_counter() - phase3_start
-            db_duration = round(phase1_time + phase2_time + phase3_time, 2)
-            print(f"[INFO] DB PHASE 3: Bulk write complete in {phase3_time:.2f}s", flush=True)
-            print(f"[INFO] DB persistence complete: {db_stats['new_records']} new | {db_stats['updated_records']} updated | {db_stats['unchanged_records']} unchanged | {db_stats['failed_records']} failed in {db_duration:.2f}s (was ~62s)", flush=True)
-            # Finish pipeline_run
-            if pipeline_run_id:
-                try:
-                    total_duration = round(time.perf_counter() - pipeline_start, 2)
-                    finish_pipeline_run(pipeline_run_id, "success", total_duration, {
-                        "total_cfr": len(journals),
-                        "total_scopus_active": scopus_stats.get("active_indexed", 0),
-                        "total_mjl_processed": len(eligible_pairs),
-                        "total_scimago_processed": len(eligible_pairs),
-                        "new_records": db_stats["new_records"],
-                        "updated_records": db_stats["updated_records"],
-                        "unchanged_records": db_stats["unchanged_records"],
-                        "failed_records": db_stats["failed_records"],
-                    })
-                except Exception as e:
-                    print(f"[WARNING] Could not finish pipeline_run: {e}")
+            except Exception as e:
+                print(f"[WARNING] Could not finish pipeline_run: {e}")
     else:
         print("[INFO] Supabase not configured (set SUPABASE_URL/KEY in .env) - skipping DB, using Excel only")
 
@@ -1243,7 +1204,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
     print(f"SCImago stage time          : {scimago_duration:.2f} sec")
     if use_db:
         print(f"DB persistence time       : {db_duration:.2f} sec")
-    print(f"TOTAL PIPELINE TIME         : {total_pipeline_time:.2f} sec ({round(total_pipeline_time / 60.0, 2)} min)")
+
     print("========================================\n")
     if use_db and pipeline_run_id:
         print(f"[SUCCESS] Pipeline run {pipeline_run_id} persisted to Supabase")
@@ -1257,8 +1218,6 @@ def main():
     parser.add_argument("--issn", type=str, default=None, help="Single ISSN to scrape (used with --scimago-only)")
     parser.add_argument("--input", type=str, default=None, help="Path to input Excel file with an 'ISSN' column")
     parser.add_argument("--workers", type=int, default=5, help="Number of concurrent workers for SCImago scraping (default: 5)")
-    parser.add_argument("--validate", action="store_true", help="Enable Validation & Approval Layer: NEW/MODIFIED/REMOVED go to change_proposals PENDING instead of direct production write")
-    parser.add_argument("--direct", action="store_true", help="Force direct production write even if validation layer exists (default)")
 
     args = parser.parse_args()
 
@@ -1273,11 +1232,7 @@ def main():
         run_single_issn(args.issn)
     else:
         scopus_path = args.scopus_file if args.scopus_file else os.path.join(OUTPUT_DIR, "scopus_source_title_list.xlsx")
-        # --validate takes precedence; --direct is default legacy behaviour
-        validate_mode = args.validate and not args.direct
-        if validate_mode:
-            print("[INFO] Validation & Approval Layer ENABLED — production will NOT be modified directly; proposals will be created PENDING review")
-        run_complete_pipeline(scopus_file=scopus_path, workers=args.workers, validate=validate_mode)
+        run_complete_pipeline(scopus_file=scopus_path, workers=args.workers)
 
 
 if __name__ == "__main__":

@@ -47,7 +47,6 @@ COOKIE_ACCEPT_ID = "onetrust-accept-btn-handler"
 _CORE_COLLECTION_CODES = {
     "D": "SCIE",
     "E": "SSCI",
-    "C": "AHCI",
     "H": "AHCI",
     "F": "ESCI",
 }
@@ -64,41 +63,45 @@ _PRODUCT_CODE_DESCRIPTIONS = {
 }
 
 
-def _extract_wos_indexes(products: list) -> str:
+def _extract_wos_indexes(products: list, jcr_categories: list = None) -> str:
     """
-    Extract Web of Science Core Collection index names from a products list.
-    Prioritises Core Collection indexes (SCIE, SSCI, AHCI, ESCI).
-    Falls back to all product descriptions if no core collection found.
-    Uses both productCode and description substring for robustness.
+    Extract Web of Science Core Collection index names from products + jcrCategories.
+    jcrCategories[].jcrEdition is authoritative (SCIE/SSCI/AHCI/ESCI) and prevents drift.
+    Falls back to products description / productCode for robustness.
     """
-    if not products:
-        return "no data"
-
     core = []
     other = []
 
-    for product in products:
-        code = str(product.get("productCode") or "").strip()
-        desc = str(product.get("description") or "").strip()
-        desc_lower = desc.lower()
+    # Authoritative source: jcrCategories.jcrEdition
+    if jcr_categories:
+        for cat in jcr_categories:
+            edition = str(cat.get("jcrEdition") or "").strip().upper()
+            if edition in ("SCIE", "SSCI", "AHCI", "ESCI"):
+                core.append(edition)
 
-        if "science citation index expanded" in desc_lower:
-            core.append("SCIE")
-            continue
-        if "social sciences citation index" in desc_lower:
-            core.append("SSCI")
-            continue
-        if "arts & humanities citation index" in desc_lower or "arts and humanities citation index" in desc_lower:
-            core.append("AHCI")
-            continue
-        if "emerging sources citation index" in desc_lower:
-            core.append("ESCI")
-            continue
+    if products:
+        for product in products:
+            code = str(product.get("productCode") or "").strip()
+            desc = str(product.get("description") or "").strip()
+            desc_lower = desc.lower()
 
-        if code in _CORE_COLLECTION_CODES:
-            core.append(_CORE_COLLECTION_CODES[code])
-        elif code in _PRODUCT_CODE_DESCRIPTIONS:
-            other.append(_PRODUCT_CODE_DESCRIPTIONS[code])
+            if "science citation index expanded" in desc_lower:
+                core.append("SCIE")
+                continue
+            if "social sciences citation index" in desc_lower:
+                core.append("SSCI")
+                continue
+            if "arts & humanities citation index" in desc_lower or "arts and humanities citation index" in desc_lower:
+                core.append("AHCI")
+                continue
+            if "emerging sources citation index" in desc_lower:
+                core.append("ESCI")
+                continue
+
+            if code in _CORE_COLLECTION_CODES:
+                core.append(_CORE_COLLECTION_CODES[code])
+            elif code in _PRODUCT_CODE_DESCRIPTIONS:
+                other.append(_PRODUCT_CODE_DESCRIPTIONS[code])
 
     if core:
         return ", ".join(sorted(set(core)))
@@ -135,7 +138,7 @@ def _parse_mjl_response(response_text: str, searched_norm_issn: str) -> Tuple[st
         e_issn = normalize_issn(str(profile.get("eissn") or ""))
 
         if searched_norm_issn and searched_norm_issn in (p_issn, e_issn):
-            index_str = _extract_wos_indexes(profile.get("products") or [])
+            index_str = _extract_wos_indexes(profile.get("products") or [], profile.get("jcrCategories") or [])
             source_title = (
                 profile.get("publicationTitle")
                 or profile.get("publicationTitleISO")
@@ -145,7 +148,7 @@ def _parse_mjl_response(response_text: str, searched_norm_issn: str) -> Tuple[st
 
     if total == 1:
         profile = profiles[0].get("journalProfile") or profiles[0]
-        index_str = _extract_wos_indexes(profile.get("products") or [])
+        index_str = _extract_wos_indexes(profile.get("products") or [], profile.get("jcrCategories") or [])
         source_title = (
             profile.get("publicationTitle")
             or profile.get("publicationTitleISO")

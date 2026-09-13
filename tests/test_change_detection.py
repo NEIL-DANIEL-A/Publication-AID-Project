@@ -178,3 +178,37 @@ def test_case_E_normalization():
     rec3n = make_record(title="Test", print_issn=normalize_issn("0129-6612"))
     rec4n = make_record(title="Test", print_issn=normalize_issn("01296612"))
     assert make_hash(rec3n) == make_hash(rec4n)
+
+
+def test_sage_dual_currency_deduplication():
+    """Verify _build_issn_map keeps both USD and GBP prices for SAGE rather than discarding GBP."""
+    from scrapers.apc import _build_issn_map
+    records = [
+        {"issn": "12345678", "publisher": "SAGE", "apc_value": "3000", "apc_currency": "USD", "mode_raw": "hybrid"},
+        {"issn": "12345678", "publisher": "SAGE", "apc_value": "2400", "apc_currency": "GBP", "mode_raw": "hybrid"},
+        {"issn": "12345678", "publisher": "SAGE", "apc_value": "3000", "apc_currency": "USD", "mode_raw": "duplicate"},
+    ]
+    res_map = _build_issn_map(records)
+    entries = res_map.get("12345678", [])
+    assert len(entries) == 2
+    currencies = [e["apc_currency"] for e in entries]
+    assert "USD" in currencies
+    assert "GBP" in currencies
+
+
+def test_supabase_client_thread_safety():
+    """Verify get_supabase_client utilizes thread lock and returns singleton."""
+    from unittest.mock import patch, MagicMock
+    from concurrent.futures import ThreadPoolExecutor
+    import database.connection as conn
+
+    mock_client = MagicMock()
+    with patch("os.getenv", side_effect=lambda k, d="": "http://example.supabase.co" if "URL" in k else "key123"), \
+         patch("supabase.create_client", return_value=mock_client) as mock_create:
+        conn._client = None
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            results = list(executor.map(lambda _: conn.get_supabase_client(), range(10)))
+        
+        assert all(c == mock_client for c in results)
+        assert mock_create.call_count == 1
+        conn._client = None

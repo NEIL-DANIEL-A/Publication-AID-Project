@@ -1,10 +1,12 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 _client = None
+_client_lock = threading.Lock()
 
 
 def get_supabase_client():
@@ -12,28 +14,32 @@ def get_supabase_client():
     Initialize and return Supabase client.
     Validates SUPABASE_URL and SUPABASE_KEY env variables.
     Raises RuntimeError if missing.
-    Reuses singleton client.
+    Reuses singleton client with thread safety.
     """
     global _client
     if _client is not None:
         return _client
 
-    url = os.getenv("SUPABASE_URL", "").strip()
-    key = os.getenv("SUPABASE_KEY", "").strip() or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    with _client_lock:
+        if _client is not None:
+            return _client
 
-    if not url or not key:
-        raise RuntimeError(
-            "Supabase credentials missing. Set SUPABASE_URL and SUPABASE_KEY (or SUPABASE_SERVICE_ROLE_KEY) in .env. "
-            "See .env.example"
-        )
+        url = os.getenv("SUPABASE_URL", "").strip()
+        key = os.getenv("SUPABASE_KEY", "").strip() or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-    try:
-        from supabase import create_client
-    except ImportError as e:
-        raise RuntimeError("supabase package not installed. Run: pip install -r requirements.txt") from e
+        if not url or not key:
+            raise RuntimeError(
+                "Supabase credentials missing. Set SUPABASE_URL and SUPABASE_KEY (or SUPABASE_SERVICE_ROLE_KEY) in .env. "
+                "See .env.example"
+            )
 
-    _client = create_client(url, key)
-    return _client
+        try:
+            from supabase import create_client
+        except ImportError as e:
+            raise RuntimeError("supabase package not installed. Run: pip install -r requirements.txt") from e
+
+        _client = create_client(url, key)
+        return _client
 
 
 def is_supabase_configured() -> bool:

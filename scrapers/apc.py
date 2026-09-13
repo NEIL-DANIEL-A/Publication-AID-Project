@@ -383,7 +383,7 @@ def _parse_springer_pdf(filepath: str, mode_label: str = "") -> List[dict]:
     return results
 
 
-def _fetch_elsevier_gpoa_issns() -> set:
+def _fetch_elsevier_gpoa_issns(cache_dir: str = None) -> set:
     """
     Fetch Elsevier GPOA (Geographical Pricing for Open Access) pilot list.
     Page: https://www.elsevier.com/about/policies-and-standards/pricing/gpoa-journals-list
@@ -391,7 +391,8 @@ def _fetch_elsevier_gpoa_issns() -> set:
     Returns set of normalized ISSNs (no hyphen, e.g. 00016918).
     Caches to apc_cache/Elsevier_GPOA.json for offline use.
     """
-    cache_path = os.path.join(APC_CACHE_DIR, "Elsevier_GPOA.json")
+    target_cache_dir = cache_dir or APC_CACHE_DIR
+    cache_path = os.path.join(target_cache_dir, "Elsevier_GPOA.json")
     gpoa_set = set()
     # Try live fetch
     try:
@@ -410,7 +411,7 @@ def _fetch_elsevier_gpoa_issns() -> set:
                 gpoa_set.add(norm)
         if gpoa_set:
             try:
-                os.makedirs(APC_CACHE_DIR, exist_ok=True)
+                os.makedirs(target_cache_dir, exist_ok=True)
                 import json as _json
                 with open(cache_path, "w", encoding="utf-8") as f:
                     _json.dump(sorted(gpoa_set), f, indent=2)
@@ -506,19 +507,20 @@ def _normalize_mode(mode_raw: str) -> str:
 
 def _build_issn_map(records: List[dict]) -> Dict[str, List[dict]]:
     """
-    Build ISSN -> list of APC records, deduplicated per (issn, publisher).
-    If the same ISSN appears multiple times from the same publisher (e.g. different
-    license modes in Wiley OA + Hybrid files), keep only the first occurrence.
-    Returns dict: normalized_issn -> [{"apc_value", "apc_currency", "mode_raw", "publisher", "mode_normalized", "has_gpoa_discount", "original_apc_value", "discounted_apc_value", "is_highlighted"}, ...]
+    Build ISSN -> list of APC records, deduplicated per (issn, publisher, apc_currency).
+    If the same ISSN appears multiple times from the same publisher with the same currency,
+    keep only the first occurrence while preserving multi-currency pricing (e.g. SAGE USD & GBP).
+    Returns dict: normalized_issn -> [{"apc_value", "apc_currency", "mode_raw", "publisher", ...}, ...]
     """
     issn_map: Dict[str, List[dict]] = {}
-    seen_publishers: Dict[str, set] = {}  # issn -> set of publishers already added
+    seen_keys: Dict[str, set] = {}  # issn -> set of (publisher, currency) tuples already added
     for rec in records:
         issn = rec["issn"]
         publisher = rec.get("publisher", "")
+        currency = rec.get("apc_currency", "")
         entry = {
             "apc_value": rec.get("apc_value", ""),
-            "apc_currency": rec.get("apc_currency", ""),
+            "apc_currency": currency,
             "mode_raw": rec.get("mode_raw", ""),
             "mode_normalized": _normalize_mode(rec.get("mode_raw", "")),
             "publisher": publisher,
@@ -529,12 +531,13 @@ def _build_issn_map(records: List[dict]) -> Dict[str, List[dict]]:
             "discount_percent": rec.get("discount_percent", 0),
             "is_highlighted": rec.get("is_highlighted", False),
         }
+        dedup_key = (publisher, currency)
         if issn not in issn_map:
             issn_map[issn] = []
-            seen_publishers[issn] = set()
-        if publisher not in seen_publishers[issn]:
+            seen_keys[issn] = set()
+        if dedup_key not in seen_keys[issn]:
             issn_map[issn].append(entry)
-            seen_publishers[issn].add(publisher)
+            seen_keys[issn].add(dedup_key)
     return issn_map
 
 
@@ -625,7 +628,7 @@ class APCVerifier:
 
         # Fetch Elsevier GPOA list (20% off pilot) and annotate Elsevier records
         print(f"  [APC] Loading Elsevier GPOA (20% off)...", end=" ", flush=True)
-        self.gpoa_issns = _fetch_elsevier_gpoa_issns()
+        self.gpoa_issns = _fetch_elsevier_gpoa_issns(self.cache_dir)
         all_records = _apply_gpoa_discount(all_records, self.gpoa_issns, percent=20)
         gpoa_hits = sum(1 for r in all_records if r.get("has_gpoa_discount"))
         self.stats["elsevier_gpoa_count"] = gpoa_hits

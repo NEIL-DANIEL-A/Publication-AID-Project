@@ -23,17 +23,9 @@ jobs:
           scrapling install
           playwright install chromium --with-deps
 
-      - name: Run Publication-AID pipeline (validation mode — no direct production write)
+      - name: Run Publication-AID pipeline (direct production write)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
-          python main.py --workers 5 --validate
-
-      - name: Upload legacy Excel artifact (debug)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cfr-results
-          path: output/cfr_scopus_mjl_scimago_results.xlsx
-          if-no-files-found: warn
+          python main.py --workers 5
