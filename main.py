@@ -952,28 +952,29 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                         old_v = old_scimago.get(f, "")
                         if _normalize_value(old_v) != _normalize_value(new_v):
                             changes.append(("scimago", f, old_v, new_v))
-                    # APC comparison (1:many - compare aggregate fields from apc_map)
+                    # APC comparison (1:many - keyed by publisher, not index)
                     old_apc_list = apc_map.get(jid, [])
-                    new_apc_list = _apc_list if '_apc_list' in locals() else []
-                    if not new_apc_list:
-                        _apc_entries = apc_lookup.get(rec["Sl.No"], [])
-                        new_apc_list = [_apc_entries] if isinstance(_apc_entries, dict) else _apc_entries
+                    _apc_entries = apc_lookup.get(rec["Sl.No"], [])
+                    new_apc_list = [_apc_entries] if isinstance(_apc_entries, dict) else list(_apc_entries) if _apc_entries else []
                     if old_apc_list or new_apc_list:
-                        # Compare aggregate: sort by publisher for deterministic order
-                        old_apc_sorted = sorted(old_apc_list, key=lambda x: _normalize_value(x.get("publisher", "")))
-                        new_apc_sorted = sorted(new_apc_list, key=lambda x: _normalize_value(x.get("publisher", "")))
-                        max_len = max(len(old_apc_sorted), len(new_apc_sorted))
-                        for i in range(max_len):
-                            old_a = old_apc_sorted[i] if i < len(old_apc_sorted) else {}
-                            new_a = new_apc_sorted[i] if i < len(new_apc_sorted) else {}
-                            pub = _normalize_value(new_a.get("publisher") or old_a.get("publisher", ""))
+                        def _apc_key(a):
+                            return _normalize_value(a.get("publisher", ""))
+                        def _mode(a):
+                            # apc_results uses apc_mode_normalized, apc_lookup uses mode_normalized
+                            return a.get("apc_mode_normalized", a.get("mode_normalized", ""))
+                        old_by_pub = {_apc_key(a): a for a in old_apc_list if _apc_key(a)}
+                        new_by_pub = {_apc_key(a): a for a in new_apc_list if _apc_key(a)}
+                        all_pubs = set(old_by_pub.keys()) | set(new_by_pub.keys())
+                        for pub in sorted(all_pubs):
+                            old_a = old_by_pub.get(pub, {})
+                            new_a = new_by_pub.get(pub, {})
                             for field, o_val, n_val in [
                                 ("apc_value", old_a.get("apc_value", ""), new_a.get("apc_value", "")),
                                 ("apc_currency", old_a.get("apc_currency", ""), new_a.get("apc_currency", "")),
-                                ("apc_mode_normalized", old_a.get("apc_mode_normalized", ""), new_a.get("apc_mode_normalized", "")),
+                                ("apc_mode_normalized", old_a.get("apc_mode_normalized", ""), _mode(new_a)),
                                 ("has_gpoa_discount", str(old_a.get("has_gpoa_discount", False)), str(new_a.get("has_gpoa_discount", False))),
-                                ("original_apc_value", old_a.get("original_apc_value", ""), new_a.get("original_apc_value", "")),
-                                ("discounted_apc_value", old_a.get("discounted_apc_value", ""), new_a.get("discounted_apc_value", "")),
+                                ("original_apc_value", old_a.get("original_apc_value", ""), new_a.get("original_apc_value", new_a.get("apc_value", ""))),
+                                ("discounted_apc_value", old_a.get("discounted_apc_value", ""), new_a.get("discounted_apc_value", new_a.get("apc_value", ""))),
                                 ("discount_percent", str(old_a.get("discount_percent", 0)), str(new_a.get("discount_percent", 0))),
                             ]:
                                 if _normalize_value(o_val) != _normalize_value(n_val):
