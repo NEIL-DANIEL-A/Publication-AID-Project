@@ -205,16 +205,11 @@ def run_source_only():
     return journals
 
 
-def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: bool = False):
+def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     """
     Complete pipeline:
     CFR collection -> Scopus Verification -> MJL Verification (hybrid) -> SCImago lookup -> Consolidated Excel.
     Filtering: Only Scopus Active / Indexed journals proceed to MJL and SCImago.
-
-    If validate=True, NEW/MODIFIED/REMOVED journals are NOT written directly to
-    production tables. Instead they are written to change_proposals with
-    status PENDING for admin approval (Validation & Approval Layer).
-    UNCHANGED journals are still touched.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     pipeline_start = time.perf_counter()
@@ -593,16 +588,14 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             journals_map = get_all_journals_map()
             unique_journals = len(set(v["id"] for v in journals_map.values())) if journals_map else 0
             journal_ids = list(set(v["id"] for v in journals_map.values())) if journals_map else []
-            # Bulk fetch all 5 child tables (1 query each) + pending proposals
+            # Bulk fetch all 5 child tables (1 query each)
             cfr_map = bulk_get_child_map("cfr_results", journal_ids)
             scopus_map = bulk_get_child_map("scopus_results", journal_ids)
             mjl_map = bulk_get_child_map("mjl_results", journal_ids)
             scimago_map = bulk_get_child_map("scimago_results", journal_ids)
             apc_map = bulk_get_apc_map(journal_ids)
-            from database.repository import bulk_get_pending_proposals_map
-            pending_proposals_map = bulk_get_pending_proposals_map()
             phase1_time = time.perf_counter() - phase1_start
-            print(f"[INFO] DB PHASE 1: Loaded {unique_journals} journals + {len(cfr_map)} cfr + {len(scopus_map)} scopus + {len(mjl_map)} mjl + {len(scimago_map)} scimago + {len(apc_map)} apc + {len(pending_proposals_map)} pending proposals in {phase1_time:.2f}s", flush=True)
+            print(f"[INFO] DB PHASE 1: Loaded {unique_journals} journals + {len(cfr_map)} cfr + {len(scopus_map)} scopus + {len(mjl_map)} mjl + {len(scimago_map)} scimago + {len(apc_map)} apc in {phase1_time:.2f}s", flush=True)
         except Exception as e:
             print(f"[WARNING] Bulk fetch failed, falling back to per-journal lookup: {e}")
             journals_map = {}
@@ -611,7 +604,6 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             mjl_map = {}
             scimago_map = {}
             apc_map = {}
-            pending_proposals_map = {}
 
         def _lookup_existing(print_raw, e_raw):
             for norm in (_norm(print_raw), _norm(e_raw)):
@@ -824,45 +816,32 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
             existing = _lookup_existing(rec["Print-ISSN"], rec["E-ISSN"])
 
             if existing is None:
-                # In validation mode, check if a pending NEW proposal already exists with identical data_hash
-                sl_str = str(rec.get("Sl.No", ""))
-                pending_new = (
-                    pending_proposals_map.get("_by_sl_no", {}).get(sl_str)
-                    if isinstance(pending_proposals_map.get("_by_sl_no"), dict) else None
-                ) or (
-                    pending_proposals_map.get("_by_hash", {}).get(new_hash)
-                    if isinstance(pending_proposals_map.get("_by_hash"), dict) else None
-                )
-                if validate and pending_new and pending_new.get("data_hash") == new_hash:
-                    # Pending proposal for this new journal already exists with identical data
-                    db_stats["unchanged_records"] += 1
-                else:
-                    # Case A: New - collect for bulk insert (or proposal creation in validation mode)
-                    to_insert_journals.append(journal_row)
-                    to_insert_cfr.append(cfr_row)
-                    to_insert_scopus.append(scopus_row)
-                    to_insert_mjl.append(mjl_row)
-                    to_insert_scimago.append(scimago_row)
-                    # Collect APC rows (1:many - could be multiple publishers)
-                    _apc_entries = apc_lookup.get(rec["Sl.No"], [])
-                    if _apc_entries:
-                        _apc_list = [_apc_entries] if isinstance(_apc_entries, dict) else _apc_entries
-                        for _apc_e in _apc_list:
-                            to_upsert_apc.append({
-                                "journal_id": "",  # filled after bulk insert
-                                "publisher": _apc_e.get("publisher", ""),
-                                "apc_value": _apc_e.get("apc_value", ""),
-                                "apc_currency": _apc_e.get("apc_currency", ""),
-                                "apc_mode_raw": _apc_e.get("mode_raw", ""),
-                                "apc_mode_normalized": _apc_e.get("mode_normalized", ""),
-                                "has_gpoa_discount": _apc_e.get("has_gpoa_discount", False),
-                                "original_apc_value": _apc_e.get("original_apc_value", _apc_e.get("apc_value", "")),
-                                "discounted_apc_value": _apc_e.get("discounted_apc_value", _apc_e.get("apc_value", "")),
-                                "discount_percent": _apc_e.get("discount_percent", 0),
-                                "is_highlighted": _apc_e.get("is_highlighted", False),
-                                "source_file": "bulk",
-                            })
-                    # Track for duplicate ISSN within same run
+                # Case A: New - collect for bulk insert
+                to_insert_journals.append(journal_row)
+                to_insert_cfr.append(cfr_row)
+                to_insert_scopus.append(scopus_row)
+                to_insert_mjl.append(mjl_row)
+                to_insert_scimago.append(scimago_row)
+                # Collect APC rows (1:many - could be multiple publishers)
+                _apc_entries = apc_lookup.get(rec["Sl.No"], [])
+                if _apc_entries:
+                    _apc_list = [_apc_entries] if isinstance(_apc_entries, dict) else _apc_entries
+                    for _apc_e in _apc_list:
+                        to_upsert_apc.append({
+                            "journal_id": "",  # filled after bulk insert
+                            "publisher": _apc_e.get("publisher", ""),
+                            "apc_value": _apc_e.get("apc_value", ""),
+                            "apc_currency": _apc_e.get("apc_currency", ""),
+                            "apc_mode_raw": _apc_e.get("mode_raw", ""),
+                            "apc_mode_normalized": _apc_e.get("mode_normalized", ""),
+                            "has_gpoa_discount": _apc_e.get("has_gpoa_discount", False),
+                            "original_apc_value": _apc_e.get("original_apc_value", _apc_e.get("apc_value", "")),
+                            "discounted_apc_value": _apc_e.get("discounted_apc_value", _apc_e.get("apc_value", "")),
+                            "discount_percent": _apc_e.get("discount_percent", 0),
+                            "is_highlighted": _apc_e.get("is_highlighted", False),
+                            "source_file": "bulk",
+                        })
+                # Track for duplicate ISSN within same run
                     for norm in (norm_p, norm_e):
                         if norm and norm != "no data":
                             new_issn_map[norm] = len(to_insert_journals) - 1  # index into list
@@ -921,10 +900,6 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5, validate: b
 
                 if old_hash_computed == new_hash:
                     # Case B: Unchanged against production
-                    to_touch_ids.append(jid)
-                    db_stats["unchanged_records"] += 1
-                elif validate and jid in pending_proposals_map and pending_proposals_map[jid].get("data_hash") == new_hash:
-                    # Case B2: Validation mode — pending proposal already exists with identical data hash!
                     to_touch_ids.append(jid)
                     db_stats["unchanged_records"] += 1
                 else:
@@ -1208,8 +1183,6 @@ def main():
     parser.add_argument("--issn", type=str, default=None, help="Single ISSN to scrape (used with --scimago-only)")
     parser.add_argument("--input", type=str, default=None, help="Path to input Excel file with an 'ISSN' column")
     parser.add_argument("--workers", type=int, default=5, help="Number of concurrent workers for SCImago scraping (default: 5)")
-    parser.add_argument("--validate", action="store_true", help="Enable Validation & Approval Layer: NEW/MODIFIED/REMOVED go to change_proposals PENDING instead of direct production write")
-    parser.add_argument("--direct", action="store_true", help="Force direct production write even if validation layer exists (default)")
 
     args = parser.parse_args()
 
@@ -1224,29 +1197,7 @@ def main():
         run_single_issn(args.issn)
     else:
         scopus_path = args.scopus_file if args.scopus_file else os.path.join(OUTPUT_DIR, "scopus_source_title_list.xlsx")
-        # Determine validation mode:
-        # 1. If --direct passed -> False
-        # 2. If --validate passed -> True
-        # 3. If neither specified -> query system_settings.validation_layer_enabled (defaults to True)
-        if args.direct:
-            validate_mode = False
-        elif args.validate:
-            validate_mode = True
-        else:
-            # Query setting from DB if available
-            try:
-                from database.repository import get_setting
-                db_setting = get_setting("validation_layer_enabled", default=True)
-                validate_mode = bool(db_setting) if db_setting is not None else True
-            except Exception:
-                validate_mode = True
-
-        if validate_mode:
-            print("[INFO] Validation & Approval Layer ENABLED — production will NOT be modified directly; proposals will be created PENDING review")
-        else:
-            print("[INFO] Validation & Approval Layer DISABLED — writing directly to production tables")
-
-        run_complete_pipeline(scopus_file=scopus_path, workers=args.workers, validate=validate_mode)
+        run_complete_pipeline(scopus_file=scopus_path, workers=args.workers)
 
 
 if __name__ == "__main__":
