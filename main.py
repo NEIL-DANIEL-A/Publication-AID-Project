@@ -970,6 +970,13 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
                             ]:
                                 if _normalize_value(o_val) != _normalize_value(n_val):
                                     changes.append(("apc", f"{pub}.{field}", o_val, n_val))
+                    if not changes and old_hash_computed != new_hash and len([c for c in changes if c[0]=="journal" and c[1]=="data_hash"]) == 0:
+                        # Debug first 3 hash-only mismatches to pinpoint volatile field
+                        if sum(1 for c in all_changes if c["source"]=="journal" and c["field_name"]=="data_hash") < 3:
+                            print(f"[DEBUG HASH MISMATCH] {rec['Full Journal Title'][:35]:35} jid={jid[:8]} old={old_hash_computed[:12]} new={new_hash[:12]}", flush=True)
+                            print(f"  old_apc_agg={old_apc_aggregate[:120]}", flush=True)
+                            print(f"  new_apc_agg={_apc_for_hash[:120]}", flush=True)
+                            print(f"  old_mode={old_apc_mode_aggregate} new_mode={_apc_mode_for_hash} old_gpoa={old_hash_input.get('has_gpoa_discount')} new_gpoa={_has_gpoa_hash}", flush=True)
                     if not changes:
                         changes.append(("journal", "data_hash", old_hash_computed, new_hash))
 
