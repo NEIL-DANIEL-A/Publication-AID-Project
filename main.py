@@ -675,32 +675,23 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
             # Compute new hash
             _mjl_match_for_hash = "No Match" if rec["MJL Status"] in ("Not Found", "Unable to Verify", "skipped", "no data") else "Print ISSN" if rec["MJL Matched ISSN"] not in ("no data", "skipped", "") else "No Match"
 
-            # Compute APC aggregates for hash
-            _apc_val = rec.get("APC Value", "no data")
-            _apc_cur = rec.get("APC Currency", "no data")
-            _apc_mode = rec.get("APC Mode", "no data")
-            _apc_for_hash = ""
-            _apc_mode_for_hash = ""
-            _has_gpoa_hash = ""
-            _orig_apc_hash = ""
-            _disc_apc_hash = ""
-            _disc_pct_hash = ""
-            if _apc_val not in ("no data", "", "N/A"):
-                # Use APC lookup's publisher (not CFR publisher) to match _compute_apc_aggregate
-                _apc_entry = apc_lookup.get(rec["Sl.No"])
-                _apc_pub = _apc_entry.get("publisher", "") if _apc_entry else ""
-                _has_gpoa = _apc_entry.get("has_gpoa_discount", False) if _apc_entry else False
-                _orig_apc = _apc_entry.get("original_apc_value", "") if _apc_entry else ""
-                _disc_apc = _apc_entry.get("discounted_apc_value", "") if _apc_entry else ""
-                _disc_pct = _apc_entry.get("discount_percent", 0) if _apc_entry else 0
-
-                _has_gpoa_hash = str(_has_gpoa)
-                _orig_apc_hash = str(_orig_apc)
-                _disc_apc_hash = str(_disc_apc)
-                _disc_pct_hash = str(_disc_pct)
-
-                _apc_for_hash = f"{_normalize_value(_apc_pub)}:{_normalize_value(_apc_cur)}:{_normalize_value(_apc_val)}:gpoa={_normalize_value(_has_gpoa_hash)}:orig={_normalize_value(_orig_apc_hash)}:disc={_normalize_value(_disc_apc_hash)}"
-                _apc_mode_for_hash = _normalize_value(_apc_mode) if _apc_mode not in ("no data", "", "N/A") else ""
+            # Compute APC aggregates for hash - use same helpers as old-hash path for consistency (handles 1:many e.g. SAGE USD+GBP)
+            _apc_entries_for_hash = apc_lookup.get(rec["Sl.No"], [])
+            if isinstance(_apc_entries_for_hash, dict):
+                _apc_entries_for_hash = [_apc_entries_for_hash]
+            _apc_for_hash = _compute_apc_aggregate(_apc_entries_for_hash) if _apc_entries_for_hash else ""
+            _apc_mode_for_hash = _compute_apc_mode_aggregate(_apc_entries_for_hash) if _apc_entries_for_hash else ""
+            # has_gpoa/original/discounted derived from same entries (any/first) to match _compute_apc_aggregate logic
+            if _apc_entries_for_hash:
+                _has_gpoa_hash = str(any(e.get("has_gpoa_discount") for e in _apc_entries_for_hash))
+                _orig_apc_hash = str(_apc_entries_for_hash[0].get("original_apc_value", _apc_entries_for_hash[0].get("apc_value","")))
+                _disc_apc_hash = str(_apc_entries_for_hash[0].get("discounted_apc_value", _apc_entries_for_hash[0].get("apc_value","")))
+                _disc_pct_hash = str(_apc_entries_for_hash[0].get("discount_percent", 0))
+            else:
+                _has_gpoa_hash = ""
+                _orig_apc_hash = ""
+                _disc_apc_hash = ""
+                _disc_pct_hash = ""
 
             # Normalize ISSN for hashing so hyphen variations don't create false changes; use _n2 helper
             _hash_print = _n2(rec["Print-ISSN"])
