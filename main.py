@@ -1008,6 +1008,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
         phase3_start = time.perf_counter()
 
         # ---------- DIRECT MODE (legacy): write straight to production ----------
+        new_ids = []
         if to_insert_journals:
             # Deduplicate by normalized_print ISSN to avoid constraint violations
             seen_print = set()
