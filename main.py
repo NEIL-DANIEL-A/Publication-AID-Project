@@ -1161,14 +1161,6 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"SCImago stage time          : {scimago_duration:.2f} sec")
     if use_db:
         print(f"DB persistence time       : {db_duration:.2f} sec")
-    # Export legacy Excel artifact expected by GitHub Actions cron workflow
-    try:
-        os.makedirs("output", exist_ok=True)
-        excel_out_path = os.path.join("output", "cfr_scopus_mjl_scimago_results.xlsx")
-        pd.DataFrame(results).to_excel(excel_out_path, index=False)
-        print(f"[INFO] Exported pipeline results to Excel artifact: {excel_out_path}", flush=True)
-    except Exception as e:
-        print(f"[WARNING] Could not export Excel artifact: {e}", flush=True)
 
     print("========================================\n")
     if use_db and pipeline_run_id:
