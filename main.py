@@ -323,7 +323,7 @@ def run_complete_pipeline(scopus_file: str = None, workers: int = 5):
     print(f"  Wiley OA            : {apc_verifier.stats.get('wiley_oa_count', 0)}")
     print(f"  Wiley Hybrid        : {apc_verifier.stats.get('wiley_hybrid_count', 0)}")
     print(f"  Elsevier            : {apc_verifier.stats.get('elsevier_count', 0)}")
-    print(f"  Elsevier GPOA 20%   : {apc_verifier.stats.get('elsevier_gpoa_count', 0)} discounted")
+    print(f"  Elsevier GPOA (20% author pays) : {apc_verifier.stats.get('elsevier_gpoa_count', 0)} discounted")
     print(f"  Springer Nature     : {apc_verifier.stats.get('springer_count', 0)}")
     print(f"  Oxford Univ Press   : {apc_verifier.stats.get('oup_count', 0)}")
     print(f"  SAGE                : {apc_verifier.stats.get('sage_count', 0)}")

@@ -387,7 +387,7 @@ def _fetch_elsevier_gpoa_issns(cache_dir: str = None) -> set:
     """
     Fetch Elsevier GPOA (Geographical Pricing for Open Access) pilot list.
     Page: https://www.elsevier.com/about/policies-and-standards/pricing/gpoa-journals-list
-    Contains | Journal Title | ISSN |  — ~300 rows with 20% off.
+    Contains | Journal Title | ISSN |  — ~300 rows (author pays 20% = 80% off).
     Returns set of normalized ISSNs (no hyphen, e.g. 00016918).
     Caches to apc_cache/Elsevier_GPOA.json for offline use.
     """
@@ -435,9 +435,9 @@ def _fetch_elsevier_gpoa_issns(cache_dir: str = None) -> set:
     return gpoa_set
 
 
-def _calc_gpoa_discount(apc_value: str, percent: int = 20) -> tuple:
+def _calc_gpoa_discount(apc_value: str, author_pays_percent: int = 20) -> tuple:
     """
-    Calculate discounted APC: 20% off original.
+    Calculate author-pays APC: author pays 20% of list price (80% discount).
     Handles strings like "3500", "$3,500.00", "3 500", "3500.00"
     Returns (original_clean, discounted_str) or (original, None) if not numeric.
     """
@@ -451,9 +451,9 @@ def _calc_gpoa_discount(apc_value: str, percent: int = 20) -> tuple:
         return apc_value, None
     try:
         original_num = float(num_match.group(1))
-        discounted_num = round(original_num * (100 - percent) / 100)
+        discounted_num = round(original_num * author_pays_percent / 100)
         # Preserve formatting: if original had decimals, keep .00? For now return int-string
-        # If original was like "3500.00", return "2800"
+        # If original was like "3500.00", return "700"
         if discounted_num == int(discounted_num):
             discounted_str = str(int(discounted_num))
         else:
@@ -463,11 +463,11 @@ def _calc_gpoa_discount(apc_value: str, percent: int = 20) -> tuple:
         return apc_value, None
 
 
-def _apply_gpoa_discount(records: List[dict], gpoa_issns: set, percent: int = 20) -> List[dict]:
+def _apply_gpoa_discount(records: List[dict], gpoa_issns: set, author_pays_percent: int = 20) -> List[dict]:
     """
     Annotate Elsevier records that are in GPOA list:
       has_gpoa_discount, original_apc_value, discounted_apc_value,
-      discount_percent, is_highlighted, apc_value becomes discounted for display,
+      author_pays_percent, is_highlighted, apc_value becomes discounted for display,
       while original kept for strikethrough.
     Card should be highlighted by default when has_gpoa_discount is true.
     """
@@ -478,12 +478,12 @@ def _apply_gpoa_discount(records: List[dict], gpoa_issns: set, percent: int = 20
             continue
         norm = rec.get("issn", "")
         if norm in gpoa_issns:
-            orig, discounted = _calc_gpoa_discount(rec.get("apc_value", ""), percent)
+            orig, discounted = _calc_gpoa_discount(rec.get("apc_value", ""), author_pays_percent)
             if discounted:
                 rec["has_gpoa_discount"] = True
                 rec["original_apc_value"] = orig
                 rec["discounted_apc_value"] = discounted
-                rec["discount_percent"] = percent
+                rec["discount_percent"] = author_pays_percent
                 rec["is_highlighted"] = True
                 # Keep apc_value as discounted for downstream lookup/display
                 # Original is preserved for strikethrough
@@ -524,7 +524,7 @@ def _build_issn_map(records: List[dict]) -> Dict[str, List[dict]]:
             "mode_raw": rec.get("mode_raw", ""),
             "mode_normalized": _normalize_mode(rec.get("mode_raw", "")),
             "publisher": publisher,
-            # GPOA discount (Elsevier 20% off) — for strikethrough + highlighted card
+            # GPOA discount (Elsevier author pays 20% = 80% off) — for strikethrough + highlighted card
             "has_gpoa_discount": rec.get("has_gpoa_discount", False),
             "original_apc_value": rec.get("original_apc_value", rec.get("apc_value", "")),
             "discounted_apc_value": rec.get("discounted_apc_value", rec.get("apc_value", "")),
@@ -626,10 +626,10 @@ class APCVerifier:
                 all_records.extend(records)
                 print(f"{len(records)} journals")
 
-        # Fetch Elsevier GPOA list (20% off pilot) and annotate Elsevier records
-        print(f"  [APC] Loading Elsevier GPOA (20% off)...", end=" ", flush=True)
+        # Fetch Elsevier GPOA list (author pays 20% = 80% off pilot) and annotate Elsevier records
+        print(f"  [APC] Loading Elsevier GPOA (author pays 20%)...", end=" ", flush=True)
         self.gpoa_issns = _fetch_elsevier_gpoa_issns(self.cache_dir)
-        all_records = _apply_gpoa_discount(all_records, self.gpoa_issns, percent=20)
+        all_records = _apply_gpoa_discount(all_records, self.gpoa_issns, author_pays_percent=20)
         gpoa_hits = sum(1 for r in all_records if r.get("has_gpoa_discount"))
         self.stats["elsevier_gpoa_count"] = gpoa_hits
         print(f"{len(self.gpoa_issns)} ISSNs in pilot, {gpoa_hits} matched")

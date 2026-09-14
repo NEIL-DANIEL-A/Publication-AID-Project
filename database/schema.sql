@@ -205,7 +205,7 @@ DO $$ BEGIN
     ALTER TABLE apc_results ADD CONSTRAINT apc_results_journal_publisher_uniq UNIQUE (journal_id, publisher);
   END IF;
 END $$;
--- GPOA discount columns (Elsevier geographical pricing 20% off)
+-- GPOA discount columns (Elsevier geographical pricing: author pays 20% = 80% off)
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='apc_results' AND column_name='has_gpoa_discount') THEN
     ALTER TABLE apc_results ADD COLUMN has_gpoa_discount BOOLEAN NOT NULL DEFAULT false;
