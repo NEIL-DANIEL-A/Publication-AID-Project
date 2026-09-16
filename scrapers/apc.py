@@ -297,8 +297,9 @@ def _parse_sage_gold_oa_xlsx(filepath: str, title_col: str, apc_col: str, curren
 
 def _parse_springer_pdf(filepath: str, mode_label: str = "") -> List[dict]:
     """
-    Parse Springer Nature APC PDF via pdfplumber using coordinate-based extraction.
-    This handles wrapped cells (Imprint column) that break standard table extraction.
+    Parse Springer Nature APC PDF via pdfplumber.
+    - Hybrid PDF: uses coordinate-based extraction (handles wrapped Imprint column)
+    - Fully OA PDF: uses standard table extraction (clean layout)
     Returns list of dicts with issn, apc_value, apc_currency, mode_raw, publisher.
     """
     results = []
@@ -308,146 +309,177 @@ def _parse_springer_pdf(filepath: str, mode_label: str = "") -> List[dict]:
         logger.warning("pdfplumber not installed - cannot parse Springer Nature PDF")
         return results
 
-    # Column boundaries based on character x positions (Springer 2026 PDF layout)
-    # Journal: ~52-400, Imprint: ~400-550, eISSN: ~550-620
-    # EUR: ~620-680, USD: ~680-740, GBP: ~740-850
-    COL_BOUNDARIES = [
-        (52, 400),   # Journal name
-        (400, 550),  # Imprint
-        (550, 620),  # eISSN
-        (620, 680),  # EUR
-        (680, 740),  # USD
-        (740, 850),  # GBP
-    ]
-
     issn_pattern = re.compile(r"\d{4}-\d{3}[\dXx]")
     price_pattern = re.compile(r"[\d,]+")
 
+    def extract_issn(text):
+        """Extract ISSN from possibly garbled text by extracting digits."""
+        if not text:
+            return None
+        m = issn_pattern.search(text)
+        if m:
+            return m.group(0)
+        digits_only = ''.join(ch for ch in text if ch.isdigit() or ch == '-')
+        m = issn_pattern.search(digits_only)
+        if m:
+            return m.group(0)
+        all_digits = ''.join(ch for ch in text if ch.isdigit())
+        if len(all_digits) >= 8:
+            for i in range(len(all_digits) - 7):
+                candidate = all_digits[i:i+8]
+                if candidate[4] in '0123456789Xx':
+                    formatted = candidate[:4] + '-' + candidate[4:]
+                    m = issn_pattern.match(formatted)
+                    if m:
+                        return formatted
+        return None
+
+    def extract_price(text):
+        """Extract price from possibly garbled text by extracting digits."""
+        if not text:
+            return None
+        nums = price_pattern.findall(text)
+        for n in nums:
+            cleaned = n.replace(",", "").strip()
+            if cleaned.isdigit() and 100 <= int(cleaned) <= 99999:
+                return cleaned
+        all_digits = ''.join(ch for ch in text if ch.isdigit())
+        if len(all_digits) >= 3:
+            for length in [4, 5, 3]:
+                for i in range(len(all_digits) - length + 1):
+                    candidate = all_digits[i:i+length]
+                    if candidate.isdigit():
+                        val = int(candidate)
+                        if 100 <= val <= 99999:
+                            return candidate
+        return None
+
+    def parse_row(row, header):
+        """Parse a single table row into a result dict."""
+        if not row or len(row) < 4:
+            return None
+        # Expected columns: Journal title, Imprint, eISSN, EUR, USD, GBP, Website
+        eissn_text = str(row[2] or "").strip() if len(row) > 2 else ""
+        eur_text = str(row[3] or "").strip() if len(row) > 3 else ""
+        usd_text = str(row[4] or "").strip() if len(row) > 4 else ""
+        gbp_text = str(row[5] or "").strip() if len(row) > 5 else ""
+
+        raw_issn = extract_issn(eissn_text)
+        if not raw_issn:
+            return None
+        norm = normalize_issn(raw_issn)
+        if norm == "no data" or not norm:
+            return None
+
+        apc_val = ""
+        apc_currency = ""
+        for price_text, cur in [(usd_text, "USD"), (eur_text, "EUR"), (gbp_text, "GBP")]:
+            val = extract_price(price_text)
+            if val:
+                apc_val = val
+                apc_currency = cur
+                break
+        if not apc_val:
+            return None
+
+        return {
+            "issn": norm,
+            "apc_value": apc_val,
+            "apc_currency": apc_currency,
+            "mode_raw": mode_label,
+            "publisher": "Springer Nature",
+        }
+
     try:
         with pdfplumber.open(filepath) as pdf:
-            for page in pdf.pages:
-                # Extract characters with coordinates
-                chars = page.chars
-                if not chars:
-                    continue
+            # Check if this is a Hybrid PDF (wrapped cells) by examining first page
+            first_page = pdf.pages[0]
+            tables = first_page.extract_tables()
+            
+            # If tables extract cleanly with expected header, use standard parsing
+            use_standard = False
+            if tables and len(tables) > 0:
+                header = tables[0][0] if tables[0] else []
+                header_str = ' '.join(str(h or '') for h in header).lower()
+                if "journal title" in header_str and "eissn" in header_str:
+                    use_standard = True
 
-                # Group characters by row (y position, 5px bins)
-                rows = {}
-                for c in chars:
-                    y = round(c['top'] / 5) * 5
-                    if y not in rows:
-                        rows[y] = []
-                    rows[y].append(c)
-
-                # Process rows in y-order
-                for y in sorted(rows.keys()):
-                    row_chars = rows[y]
-                    row_chars.sort(key=lambda c: c['x0'])
-
-                    # Extract text for each column
-                    col_texts = []
-                    for x_start, x_end in COL_BOUNDARIES:
-                        col_text = ''.join(c['text'] for c in row_chars if x_start <= c['x0'] < x_end)
-                        col_texts.append(col_text.strip())
-
-                    # Skip header/footer rows
-                    if not any(col_texts):
-                        continue
-                    if any(h in col_texts[0].lower() for h in ("journal name", "apcs correct", "springer nature")):
-                        continue
-
-                    # col_texts = [journal_name, imprint, eissn, eur, usd, gbp]
-                    if len(col_texts) < 4:
-                        continue
-
-                    eissn_text = col_texts[2]
-                    eur_text = col_texts[3]
-                    usd_text = col_texts[4] if len(col_texts) > 4 else ""
-                    gbp_text = col_texts[5] if len(col_texts) > 5 else ""
-
-                    # Find ISSN in eISSN column (handles garbled text)
-                    def extract_issn(text):
-                        """Extract ISSN from possibly garbled text by extracting digits."""
-                        # First try standard pattern
-                        m = issn_pattern.search(text)
-                        if m:
-                            return m.group(0)
-                        # Fallback: extract all digits and hyphens, look for XXXX-XXXX pattern
-                        digits_only = ''.join(ch for ch in text if ch.isdigit() or ch == '-')
-                        m = issn_pattern.search(digits_only)
-                        if m:
-                            return m.group(0)
-                        # Last resort: extract all digits, group as XXXX-XXXX
-                        all_digits = ''.join(ch for ch in text if ch.isdigit())
-                        if len(all_digits) >= 8:
-                            # Try to find XXXX-XXXX pattern in consecutive digits
-                            for i in range(len(all_digits) - 7):
-                                candidate = all_digits[i:i+8]
-                                if candidate[4] in '0123456789Xx':  # 5th char can be X
-                                    # Format as XXXX-XXXX
-                                    formatted = candidate[:4] + '-' + candidate[4:]
-                                    m = issn_pattern.match(formatted)
-                                    if m:
-                                        return formatted
-                        return None
-
-                    raw_issn = extract_issn(eissn_text)
-                    if not raw_issn:
-                        raw_issn = extract_issn(col_texts[1])  # imprint column
-                    if not raw_issn:
-                        # Try combined eissn + imprint
-                        raw_issn = extract_issn(eissn_text + col_texts[1])
-                    if not raw_issn:
-                        continue
-                    norm = normalize_issn(raw_issn)
-                    if norm == "no data" or not norm:
-                        continue
-
-                    # Extract price numbers from USD column (preferred), then EUR, then GBP
-                    def extract_price(text):
-                        """Extract price from possibly garbled text by extracting digits."""
-                        # First try standard pattern
-                        nums = price_pattern.findall(text)
-                        for n in nums:
-                            cleaned = n.replace(",", "").strip()
-                            if cleaned.isdigit() and 100 <= int(cleaned) <= 99999:
-                                return cleaned
-                        # Fallback: extract all digits
-                        all_digits = ''.join(ch for ch in text if ch.isdigit())
-                        # Look for 3-5 digit price (skip ISSN digits)
-                        if len(all_digits) >= 3:
-                            # Try different lengths: 3, 4, or 5 digits
-                            for length in [4, 5, 3]:
-                                for i in range(len(all_digits) - length + 1):
-                                    candidate = all_digits[i:i+length]
-                                    if candidate.isdigit():
-                                        val = int(candidate)
-                                        if 100 <= val <= 99999:
-                                            return candidate
-                        return None
-
-                    apc_val = ""
-                    apc_currency = ""
-                    for price_text, cur in [(usd_text, "USD"), (eur_text, "EUR"), (gbp_text, "GBP")]:
-                        if not price_text:
+            if use_standard:
+                # Standard table extraction (works for Fully OA)
+                for page in pdf.pages:
+                    tables = page.extract_tables()
+                    for table in tables:
+                        if not table or len(table) < 2:
                             continue
-                        val = extract_price(price_text)
-                        if val:
-                            apc_val = val
-                            apc_currency = cur
-                            break
-
-                    if not apc_val:
+                        header = [str(c or "").strip() for c in table[0]]
+                        for row in table[1:]:
+                            parsed = parse_row(row, header)
+                            if parsed:
+                                results.append(parsed)
+            else:
+                # Coordinate-based extraction (for Hybrid with wrapped Imprint column)
+                COL_BOUNDARIES = [
+                    (52, 400),   # Journal name
+                    (400, 550),  # Imprint
+                    (550, 620),  # eISSN
+                    (620, 680),  # EUR
+                    (680, 740),  # USD
+                    (740, 850),  # GBP
+                ]
+                for page in pdf.pages:
+                    chars = page.chars
+                    if not chars:
                         continue
-
-                    mode_val = mode_label if mode_label else ""
-                    results.append({
-                        "issn": norm,
-                        "apc_value": apc_val,
-                        "apc_currency": apc_currency,
-                        "mode_raw": mode_val,
-                        "publisher": "Springer Nature",
-                    })
+                    rows = {}
+                    for c in chars:
+                        y = round(c['top'] / 5) * 5
+                        if y not in rows:
+                            rows[y] = []
+                        rows[y].append(c)
+                    for y in sorted(rows.keys()):
+                        row_chars = rows[y]
+                        row_chars.sort(key=lambda c: c['x0'])
+                        col_texts = []
+                        for x_start, x_end in COL_BOUNDARIES:
+                            col_text = ''.join(c['text'] for c in row_chars if x_start <= c['x0'] < x_end)
+                            col_texts.append(col_text.strip())
+                        if not any(col_texts):
+                            continue
+                        if any(h in col_texts[0].lower() for h in ("journal name", "apcs correct", "springer nature")):
+                            continue
+                        if len(col_texts) < 4:
+                            continue
+                        eissn_text = col_texts[2]
+                        eur_text = col_texts[3]
+                        usd_text = col_texts[4] if len(col_texts) > 4 else ""
+                        gbp_text = col_texts[5] if len(col_texts) > 5 else ""
+                        raw_issn = extract_issn(eissn_text)
+                        if not raw_issn:
+                            raw_issn = extract_issn(col_texts[1])
+                        if not raw_issn:
+                            raw_issn = extract_issn(eissn_text + col_texts[1])
+                        if not raw_issn:
+                            continue
+                        norm = normalize_issn(raw_issn)
+                        if norm == "no data" or not norm:
+                            continue
+                        apc_val = ""
+                        apc_currency = ""
+                        for price_text, cur in [(usd_text, "USD"), (eur_text, "EUR"), (gbp_text, "GBP")]:
+                            val = extract_price(price_text)
+                            if val:
+                                apc_val = val
+                                apc_currency = cur
+                                break
+                        if not apc_val:
+                            continue
+                        results.append({
+                            "issn": norm,
+                            "apc_value": apc_val,
+                            "apc_currency": apc_currency,
+                            "mode_raw": mode_label,
+                            "publisher": "Springer Nature",
+                        })
     except Exception as e:
         logger.warning(f"Failed to parse Springer Nature PDF {filepath}: {e}")
 
