@@ -82,7 +82,8 @@ def run_pipeline():
 
     # 3. Load Scopus Master List & Map to Source IDs
     print("\n[3/5] Mapping journals to Scopus Source IDs via Master Registry ...", flush=True)
-    master_file = "scopus_master_list.xlsx"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    master_file = os.path.join(script_dir, "scopus_master_list.xlsx")
     if not os.path.exists(master_file):
         print(f"      [!] {master_file} missing. Downloading...", flush=True)
         url = "https://downloads.ctfassets.net/o78em1y1w4i4/7xtaTxNiNcWRTeZkV86eNy/69cf2d506c905dc299531fdc93049dbb/ext_list_Aug_2026.xlsx"
@@ -174,46 +175,53 @@ def run_pipeline():
             "year": "2025"
         }
         try:
-            r = session.post("https://www.scopus.com/sources.uri", data=payload, timeout=20)
-            if r.status_code == 200:
-                sel = Selector(r.text)
-                pre = sel.css("#resultsJson")
-                if not pre:
-                    print(f"\n      [!] Could not find #resultsJson on offset {offset}. Stopping stream.", flush=True)
-                    break
+            r = session.post("https://www.scopus.com/sources.uri", data=payload, timeout=25)
+            if r.status_code == 429:
+                print(f"\n      [!] Rate limit (429) at offset {offset}. Backing off 6 seconds...", flush=True)
+                time.sleep(6)
+                continue
+            elif r.status_code != 200:
+                print(f"\n      [!] HTTP status {r.status_code} at offset {offset}. Retrying after 4 seconds...", flush=True)
+                time.sleep(4)
+                continue
 
-                raw_json = html.unescape(pre[0].text)
-                data = json.loads(raw_json)
-                results = data.get("results", [])
-                if not results:
-                    break
-
-                for item in results:
-                    sid = str(item.get("id")) if item.get("id") else None
-                    issn_norm = norm_issn(item.get("issn"))
-                    metric_data = {
-                        "citescore": parse_numeric(item.get("citescore")),
-                        "sjr": parse_numeric(item.get("sjr")),
-                        "snip": parse_numeric(item.get("snip")),
-                        "publisher": item.get("publisher"),
-                        "subarea": item.get("subarea")
-                    }
-                    if sid:
-                        metrics_by_source_id[sid] = metric_data
-                    if issn_norm:
-                        metrics_by_issn[issn_norm] = metric_data
-
-                offset += len(results)
-                print(f"        Processed {len(metrics_by_source_id)} source metrics (offset {offset} / {data.get('totalResultsCount', 50040)}) ...", end="\r", flush=True)
-
-                if len(results) < batch_size:
-                    break
-            else:
-                print(f"\n      [!] POST failed with status {r.status_code}", flush=True)
+            sel = Selector(r.text)
+            pre = sel.css("#resultsJson")
+            if not pre:
+                print(f"\n      [!] Could not find #resultsJson on offset {offset}. Stopping stream.", flush=True)
                 break
+
+            raw_json = html.unescape(pre[0].text)
+            data = json.loads(raw_json)
+            results = data.get("results", [])
+            if not results:
+                break
+
+            for item in results:
+                sid = str(item.get("id")) if item.get("id") else None
+                issn_norm = norm_issn(item.get("issn"))
+                metric_data = {
+                    "citescore": parse_numeric(item.get("citescore")),
+                    "sjr": parse_numeric(item.get("sjr")),
+                    "snip": parse_numeric(item.get("snip")),
+                    "publisher": item.get("publisher"),
+                    "subarea": item.get("subarea")
+                }
+                if sid:
+                    metrics_by_source_id[sid] = metric_data
+                if issn_norm:
+                    metrics_by_issn[issn_norm] = metric_data
+
+            offset += len(results)
+            print(f"        Processed {len(metrics_by_source_id)} source metrics (offset {offset} / {data.get('totalResultsCount', 50040)}) ...", end="\r", flush=True)
+
+            if len(results) < batch_size:
+                break
+
+            time.sleep(0.35)  # Rate limit safety delay
         except Exception as ex:
-            print(f"\n      [!] Exception on offset {offset}: {ex}", flush=True)
-            break
+            print(f"\n      [!] Exception on offset {offset}: {ex}. Retrying in 3s...", flush=True)
+            time.sleep(3)
 
     print(f"\n      [+] Completed streaming! Unique sources with metrics: {len(metrics_by_source_id)}", flush=True)
 
@@ -249,7 +257,7 @@ def run_pipeline():
         final_records.append(rec)
 
     # Save local CSV backup
-    backup_file = "scopus_12k_additional_data.csv"
+    backup_file = os.path.join(script_dir, "scopus_12k_additional_data.csv")
     pd.DataFrame(final_records).to_csv(backup_file, index=False)
     print(f"      [+] Saved local backup CSV to '{backup_file}'.", flush=True)
 
