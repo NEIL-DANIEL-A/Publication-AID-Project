@@ -1,18 +1,66 @@
-name: aid-daily
+name: Scheduled Pipelines (AID & Scopus)
 
 on:
   schedule:
-    - cron: '30 20 * * *'  # daily 02:00 IST (20:30 UTC)
-  workflow_dispatch: {}  # manual trigger
+    # 8:30 PM IST (20:30 IST = 15:00 UTC) daily - Scopus Scraper
+    - cron: '0 15 * * *'
+    # 02:00 AM IST (02:00 IST = 20:30 UTC) daily - Publication-AID Main Pipeline
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+    inputs:
+      job_to_run:
+        description: 'Select which pipeline to execute'
+        required: true
+        default: 'scopus-scraper'
+        type: choice
+        options:
+          - scopus-scraper
+          - aid-pipeline
+          - both
 
 jobs:
-  run:
+  scopus-scraper:
+    name: Scrape Scopus & Sync Supabase (8:30 PM IST)
+    if: (github.event_name == 'schedule' && github.event.schedule == '0 15 * * *') || (github.event_name == 'workflow_dispatch' && (inputs.job_to_run == 'scopus-scraper' || inputs.job_to_run == 'both'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          scrapling install
+          playwright install chromium --with-deps
+
+      - name: Run Scopus scraper pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python scopus/fetch_and_push_12k.py
+
+  aid-pipeline:
+    name: Run Publication-AID Pipeline (2:00 AM IST)
+    if: (github.event_name == 'schedule' && github.event.schedule == '30 20 * * *') || (github.event_name == 'workflow_dispatch' && (inputs.job_to_run == 'aid-pipeline' || inputs.job_to_run == 'both'))
     runs-on: ubuntu-latest
     timeout-minutes: 150
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
