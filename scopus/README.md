@@ -15,6 +15,8 @@ This module fetches real-time Scopus metrics (**CiteScore**, **SJR**, **SNIP**, 
 | `setup_supabase_table.sql` | SQL schema migration creating the `Scopus_additional_data` table, indexes, unique constraints, and RLS policies. |
 | `schema.sql` | Base schema reference for the Supabase database. |
 | `scopus_12k_additional_data.csv`| Enriched dataset of 12,196 journals with Scopus CiteScore, SJR, SNIP, publisher, and subject area. |
+| `journals_with_null_metrics.csv` | List of 285 discontinued or inactive journals where all 3 metrics (CiteScore, SJR, SNIP) are NULL. |
+| `journals_with_at_least_one_null_metric.csv` | List of 419 journals where at least one metric (CiteScore, SJR, or SNIP) is NULL. |
 | `matched_journals.csv` | Initial mapping of Supabase journals to Scopus Sourcerecord IDs via normalized ISSN / E-ISSN. |
 | `scopus_journals.csv` | Sample verification dataset of top Scopus journals. |
 | `.env.example` | Environment variables template (`SUPABASE_URL`, `SUPABASE_KEY`). |
