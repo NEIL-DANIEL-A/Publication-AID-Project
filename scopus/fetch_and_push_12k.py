@@ -257,16 +257,18 @@ def run_pipeline():
         backup_csv = os.path.join(script_dir, "scopus_12k_additional_data.csv")
         if os.path.exists(backup_csv):
             print(f"      [+] Loading metrics from committed CSV: {backup_csv}", flush=True)
-            df_bak = pd.read_csv(backup_csv)
+            df_bak = pd.read_csv(backup_csv).fillna("")
             for _, row in df_bak.iterrows():
                 p = norm_issn(row.get("issn"))
                 e = norm_issn(row.get("e_issn"))
+                pub_val = str(row.get("publisher", "")).strip()
+                sub_val = str(row.get("subject_area", "")).strip()
                 m_data = {
                     "citescore": parse_numeric(row.get("citescore")),
                     "sjr": parse_numeric(row.get("sjr")),
                     "snip": parse_numeric(row.get("snip")),
-                    "publisher": row.get("publisher"),
-                    "subarea": row.get("subject_area")
+                    "publisher": pub_val if pub_val and pub_val != "nan" else "N/A",
+                    "subarea": sub_val if sub_val and sub_val != "nan" else "N/A"
                 }
                 if p:
                     metrics_by_issn[p] = m_data
@@ -292,18 +294,29 @@ def run_pipeline():
         else:
             m = {}
 
+        pub_candidate = m.get("publisher") or j["scopus_publisher"] or "N/A"
+        sub_candidate = m.get("subarea") or "N/A"
+
         rec = {
             "journal_id": j["journal_id"],
-            "journal_name": j["title"],
-            "issn": j["print_issn"] or "N/A",
-            "e_issn": j["e_issn"] or "N/A",
-            "publisher": m.get("publisher") or j["scopus_publisher"] or "N/A",
-            "subject_area": m.get("subarea") or "N/A",
+            "journal_name": str(j["title"]) if j.get("title") else "N/A",
+            "issn": str(j["print_issn"]) if j.get("print_issn") else "N/A",
+            "e_issn": str(j["e_issn"]) if j.get("e_issn") else "N/A",
+            "publisher": str(pub_candidate) if pub_candidate and str(pub_candidate) != "nan" else "N/A",
+            "subject_area": str(sub_candidate) if sub_candidate and str(sub_candidate) != "nan" else "N/A",
             "citescore": m.get("citescore"),
             "sjr": m.get("sjr"),
             "snip": m.get("snip")
         }
         final_records.append(rec)
+
+    # Sanitize every record to guarantee pure JSON compliance (None for null numerics, 'N/A' for null strings)
+    for r in final_records:
+        for k, v in r.items():
+            if v is None or pd.isna(v):
+                r[k] = None if k in ["citescore", "sjr", "snip"] else "N/A"
+            elif isinstance(v, float) and math.isnan(v):
+                r[k] = None if k in ["citescore", "sjr", "snip"] else "N/A"
 
     # Save local CSV backup
     backup_file = os.path.join(script_dir, "scopus_12k_additional_data.csv")
