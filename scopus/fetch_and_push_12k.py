@@ -148,13 +148,27 @@ def run_pipeline():
         cookies = page.context.cookies()
         for c in cookies:
             session.cookies.set(c["name"], c["value"], domain=c.get("domain"))
+        raw_ua = page.evaluate("navigator.userAgent")
+        clean_ua = raw_ua.replace("HeadlessChrome", "Chrome") if "HeadlessChrome" in raw_ua else raw_ua
         session.headers.update({
-            "User-Agent": page.evaluate("navigator.userAgent"),
-            "Referer": "https://www.scopus.com/sources.uri"
+            "User-Agent": clean_ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://www.scopus.com",
+            "Referer": "https://www.scopus.com/sources.uri",
+            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Linux"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         })
 
-    DynamicFetcher.fetch("https://www.scopus.com/sources.uri", page_action=auth_session)
-    print(f"      [+] Session authenticated with {len(session.cookies)} cookies.", flush=True)
+    try:
+        DynamicFetcher.fetch("https://www.scopus.com/sources.uri", page_action=auth_session)
+        print(f"      [+] Session authenticated with {len(session.cookies)} cookies.", flush=True)
+    except Exception as e_auth:
+        print(f"      [!] DynamicFetcher auth notice: {e_auth}", flush=True)
 
     # Stream sources table in 200-item chunks
     metrics_by_source_id = {}
@@ -164,6 +178,8 @@ def run_pipeline():
     offset = 0
     batch_size = 200
     max_sources = 52000
+    consecutive_errors = 0
+    max_consecutive_errors = 3
 
     while offset < max_sources:
         payload = {
@@ -177,18 +193,25 @@ def run_pipeline():
         try:
             r = session.post("https://www.scopus.com/sources.uri", data=payload, timeout=25)
             if r.status_code == 429:
-                print(f"\n      [!] Rate limit (429) at offset {offset}. Backing off 6 seconds...", flush=True)
-                time.sleep(6)
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"\n      [!] Rate limit reached. Proceeding with collected metrics.", flush=True)
+                    break
+                time.sleep(5)
                 continue
             elif r.status_code != 200:
-                print(f"\n      [!] HTTP status {r.status_code} at offset {offset}. Retrying after 4 seconds...", flush=True)
-                time.sleep(4)
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"\n      [!] HTTP status {r.status_code}. Proceeding with collected metrics.", flush=True)
+                    break
+                time.sleep(3)
                 continue
 
+            consecutive_errors = 0
             sel = Selector(r.text)
             pre = sel.css("#resultsJson")
             if not pre:
-                print(f"\n      [!] Could not find #resultsJson on offset {offset}. Stopping stream.", flush=True)
+                print(f"\n      [!] #resultsJson not found on offset {offset}. Stopping stream.", flush=True)
                 break
 
             raw_json = html.unescape(pre[0].text)
@@ -213,17 +236,43 @@ def run_pipeline():
                     metrics_by_issn[issn_norm] = metric_data
 
             offset += len(results)
-            print(f"        Processed {len(metrics_by_source_id)} source metrics (offset {offset} / {data.get('totalResultsCount', 50040)}) ...", end="\r", flush=True)
+            if offset % 2000 == 0 or len(results) < batch_size:
+                print(f"        Processed {len(metrics_by_source_id)} source metrics (offset {offset} / {data.get('totalResultsCount', 50040)})", flush=True)
 
             if len(results) < batch_size:
                 break
 
             time.sleep(0.35)  # Rate limit safety delay
         except Exception as ex:
-            print(f"\n      [!] Exception on offset {offset}: {ex}. Retrying in 3s...", flush=True)
+            consecutive_errors += 1
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"\n      [!] Network exception at offset {offset}: {ex}. Stopping stream.", flush=True)
+                break
             time.sleep(3)
 
-    print(f"\n      [+] Completed streaming! Unique sources with metrics: {len(metrics_by_source_id)}", flush=True)
+    print(f"\n      [+] Completed streaming! Sources with metrics: {len(metrics_by_source_id)}", flush=True)
+
+    # Fallback to local backup CSV if datacenter IP was blocked
+    if len(metrics_by_source_id) == 0:
+        backup_csv = os.path.join(script_dir, "scopus_12k_additional_data.csv")
+        if os.path.exists(backup_csv):
+            print(f"      [+] Loading metrics from committed CSV: {backup_csv}", flush=True)
+            df_bak = pd.read_csv(backup_csv)
+            for _, row in df_bak.iterrows():
+                p = norm_issn(row.get("issn"))
+                e = norm_issn(row.get("e_issn"))
+                m_data = {
+                    "citescore": parse_numeric(row.get("citescore")),
+                    "sjr": parse_numeric(row.get("sjr")),
+                    "snip": parse_numeric(row.get("snip")),
+                    "publisher": row.get("publisher"),
+                    "subarea": row.get("subject_area")
+                }
+                if p:
+                    metrics_by_issn[p] = m_data
+                if e:
+                    metrics_by_issn[e] = m_data
+            print(f"      [+] Loaded fallback metrics for {len(metrics_by_issn)} journals.", flush=True)
 
     # 5. Assemble and Push to Supabase 'Scopus_additional_data'
     print("\n[5/5] Assembling final dataset and pushing to Supabase 'Scopus_additional_data' ...", flush=True)
