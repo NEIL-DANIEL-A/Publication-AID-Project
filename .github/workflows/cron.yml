@@ -18,10 +18,15 @@ on:
           - aid-pipeline
           - both
 
+permissions:
+  contents: write
+
 jobs:
   scopus-scraper:
     name: Scrape Scopus & Sync Supabase (8:30 PM IST)
-    if: (github.event_name == 'schedule' && github.event.schedule == '0 15 * * *') || (github.event_name == 'workflow_dispatch' && (inputs.job_to_run == 'scopus-scraper' || inputs.job_to_run == 'both'))
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 15 * * *') ||
+      (github.event_name == 'workflow_dispatch' && ((inputs.job_to_run || github.event.inputs.job_to_run) == 'scopus-scraper' || (inputs.job_to_run || github.event.inputs.job_to_run) == 'both'))
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -45,13 +50,18 @@ jobs:
       - name: Run Scopus scraper pipeline
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY || secrets.SUPABASE_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY || secrets.SUPABASE_KEY }}
+          PYTHONUNBUFFERED: "1"
         run: |
           python scopus/fetch_and_push_12k.py
+          python scopus/scrape_historical_metrics.py
 
   aid-pipeline:
     name: Run Publication-AID Pipeline (2:00 AM IST)
-    if: (github.event_name == 'schedule' && github.event.schedule == '30 20 * * *') || (github.event_name == 'workflow_dispatch' && (inputs.job_to_run == 'aid-pipeline' || inputs.job_to_run == 'both'))
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '30 20 * * *') ||
+      (github.event_name == 'workflow_dispatch' && ((inputs.job_to_run || github.event.inputs.job_to_run) == 'aid-pipeline' || (inputs.job_to_run || github.event.inputs.job_to_run) == 'both'))
     runs-on: ubuntu-latest
     timeout-minutes: 150
 
@@ -74,6 +84,8 @@ jobs:
       - name: Run Publication-AID pipeline (direct production write)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY || secrets.SUPABASE_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY || secrets.SUPABASE_KEY }}
+          PYTHONUNBUFFERED: "1"
         run: |
           python main.py --workers 5
