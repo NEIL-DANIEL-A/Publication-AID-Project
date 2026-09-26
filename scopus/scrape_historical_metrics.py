@@ -60,7 +60,7 @@ def fetch_citescore_fast(sid: int) -> dict:
 
 def scrape_web_profile(sid: int) -> dict:
     """Scrape Scopus web profile page to extract historical SJR and SNIP."""
-    res = {"sjr": None, "sjr_year": None, "snip": None, "snip_year": None}
+    res = {"sjr": None, "sjr_year": None, "snip": None, "snip_year": None, "coverage": None, "source_type": None}
 
     def parse(page):
         page.wait_for_timeout(2000)
@@ -84,6 +84,14 @@ def scrape_web_profile(sid: int) -> dict:
                 res["snip"] = float(m_val.group(1))
             if m_yr:
                 res["snip_year"] = int(m_yr.group(1))
+
+        # Parse Years currently covered by Scopus & Source type
+        cov_el = page.locator('li:has-text("Years currently covered by Scopus:") span.right').first
+        if cov_el:
+            res["coverage"] = cov_el.inner_text().strip()
+        st_el = page.locator('li:has-text("Source type:") span.right').first
+        if st_el:
+            res["source_type"] = st_el.inner_text().strip()
 
     try:
         DynamicFetcher.fetch(f"https://www.scopus.com/sourceid/{sid}", page_action=parse)
@@ -270,16 +278,22 @@ def main():
     print("\nPushing updated metrics and status to Supabase...", flush=True)
     client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # Check if 'status' column exists in Supabase
+    # Check if 'status', 'coverage', 'source_type' columns exist in Supabase
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-    r_check = requests.get(f"{SUPABASE_URL}/rest/v1/Scopus_additional_data?select=status&limit=1", headers=headers)
-    has_status_col = (r_check.status_code == 200)
-
-    if has_status_col:
-        print("[+] 'status' column confirmed in Supabase table. Pushing full dataset including status...", flush=True)
+    r_check = requests.get(f"{SUPABASE_URL}/rest/v1/Scopus_additional_data?select=status,coverage,source_type&limit=1", headers=headers)
+    has_status_col = False
+    has_cov_col = False
+    has_st_col = False
+    if r_check.status_code == 200:
+        has_status_col = True
+        has_cov_col = True
+        has_st_col = True
     else:
-        print("[!] Note: 'status' column does not exist yet in Supabase.", flush=True)
-        print("    Pushing updated CiteScore, SJR, and SNIP metrics first.", flush=True)
+        has_status_col = (requests.get(f"{SUPABASE_URL}/rest/v1/Scopus_additional_data?select=status&limit=1", headers=headers).status_code == 200)
+        has_cov_col = (requests.get(f"{SUPABASE_URL}/rest/v1/Scopus_additional_data?select=coverage&limit=1", headers=headers).status_code == 200)
+        has_st_col = (requests.get(f"{SUPABASE_URL}/rest/v1/Scopus_additional_data?select=source_type&limit=1", headers=headers).status_code == 200)
+
+    print(f"[Schema check] status={has_status_col}, coverage={has_cov_col}, source_type={has_st_col}", flush=True)
 
     # Push inactive rows update
     records_to_push = []
@@ -292,6 +306,10 @@ def main():
         }
         if has_status_col:
             rec["status"] = r["status"]
+        if has_cov_col and "coverage" in r and pd.notna(r["coverage"]) and str(r["coverage"]).strip():
+            rec["coverage"] = str(r["coverage"]).strip()
+        if has_st_col and "source_type" in r and pd.notna(r["source_type"]) and str(r["source_type"]).strip():
+            rec["source_type"] = str(r["source_type"]).strip()
         records_to_push.append(rec)
 
     batch_size = 100
@@ -300,8 +318,23 @@ def main():
         client.table("Scopus_additional_data").upsert(b, on_conflict="journal_id").execute()
     print(f"[+] Successfully pushed {len(records_to_push)} inactive records to Supabase!")
 
-    if has_status_col:
-        # Also push status='active' for the other 11,777 rows
+    if has_cov_col or has_st_col:
+        print("Pushing coverage, source_type, and status for all active journals...", flush=True)
+        active_records = []
+        for _, r in df_12k[df_12k["status"] == "active"].iterrows():
+            item = {"journal_id": str(r["journal_id"])}
+            if has_status_col:
+                item["status"] = "active"
+            if has_cov_col and "coverage" in r and pd.notna(r["coverage"]) and str(r["coverage"]).strip():
+                item["coverage"] = str(r["coverage"]).strip()
+            if has_st_col and "source_type" in r and pd.notna(r["source_type"]) and str(r["source_type"]).strip():
+                item["source_type"] = str(r["source_type"]).strip()
+            active_records.append(item)
+        for i in range(0, len(active_records), 500):
+            b = active_records[i:i+500]
+            client.table("Scopus_additional_data").upsert(b, on_conflict="journal_id").execute()
+        print(f"[+] Successfully pushed coverage and source_type for {len(active_records)} active journals to Supabase!")
+    elif has_status_col:
         print("Pushing status='active' for active journals...", flush=True)
         active_records = [{"journal_id": str(r["journal_id"]), "status": "active"} for _, r in df_12k[df_12k["status"] == "active"].iterrows()]
         for i in range(0, len(active_records), 500):

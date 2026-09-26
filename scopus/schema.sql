@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS public.scopus_journals (
     citescore NUMERIC,
     sjr NUMERIC,
     snip NUMERIC,
+    status TEXT DEFAULT 'active',
+    coverage TEXT,
+    source_type TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     CONSTRAINT unique_journal_issn UNIQUE (journal_name, issn, e_issn)
 );

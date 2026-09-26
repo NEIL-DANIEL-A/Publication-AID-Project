@@ -13,6 +13,8 @@ ALTER TABLE IF EXISTS public."Scopus_additional_data"
     ADD COLUMN IF NOT EXISTS sjr NUMERIC,
     ADD COLUMN IF NOT EXISTS snip NUMERIC,
     ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active',
+    ADD COLUMN IF NOT EXISTS coverage TEXT,
+    ADD COLUMN IF NOT EXISTS source_type TEXT,
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 -- 2. Add Unique Constraint on journal_id to allow upserts

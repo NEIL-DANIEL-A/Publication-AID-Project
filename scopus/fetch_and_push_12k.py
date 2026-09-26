@@ -51,6 +51,38 @@ def parse_numeric(val: Any) -> Optional[float]:
         return None
 
 
+def format_scopus_coverage(cov_raw: Any) -> Optional[str]:
+    """Formats raw Excel coverage string into exact Scopus website format."""
+    if cov_raw is None or pd.isna(cov_raw):
+        return None
+    s = str(cov_raw).strip()
+    if not s or s in ["nan", "N/A", "None"]:
+        return None
+
+    chunks = [c.strip() for c in s.split(";") if c.strip()]
+    if not chunks:
+        return None
+
+    parsed_chunks = []
+    for c in chunks:
+        if "-" in c:
+            parts = c.split("-")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                start, end = int(parts[0]), int(parts[1])
+                formatted = f"from {parts[0]} to {parts[1]}"
+                parsed_chunks.append((start, end, formatted))
+            else:
+                parsed_chunks.append((9999, 9999, c))
+        elif c.isdigit():
+            y = int(c)
+            parsed_chunks.append((y, y, str(y)))
+        else:
+            parsed_chunks.append((9999, 9999, c))
+
+    parsed_chunks.sort(key=lambda x: (x[0], x[1]))
+    return ", ".join(x[2] for x in parsed_chunks)
+
+
 def run_pipeline():
     t_start = time.time()
     print("=" * 70, flush=True)
@@ -107,7 +139,9 @@ def run_pipeline():
             "scopus_title": title,
             "scopus_publisher": pub,
             "scopus_issn": format_issn(issn),
-            "scopus_eissn": format_issn(eissn)
+            "scopus_eissn": format_issn(eissn),
+            "coverage": format_scopus_coverage(r["Coverage"]) if "Coverage" in r else None,
+            "source_type": str(r["Source Type"]).strip() if "Source Type" in r and r["Source Type"] else "N/A"
         }
         if issn:
             scopus_lookup[issn] = entry
@@ -132,6 +166,8 @@ def run_pipeline():
             "e_issn": j.get("e_issn") or format_issn(e),
             "source_id": info["source_id"] if info else None,
             "scopus_publisher": info["scopus_publisher"] if info else (j.get("publisher") or "N/A"),
+            "coverage": info["coverage"] if info else None,
+            "source_type": info["source_type"] if info else None,
             "norm_p": p,
             "norm_e": e
         })
@@ -306,7 +342,10 @@ def run_pipeline():
             "subject_area": str(sub_candidate) if sub_candidate and str(sub_candidate) != "nan" else "N/A",
             "citescore": m.get("citescore"),
             "sjr": m.get("sjr"),
-            "snip": m.get("snip")
+            "snip": m.get("snip"),
+            "status": "active" if (m.get("citescore") is not None and m.get("sjr") is not None and m.get("snip") is not None) else "inactive",
+            "coverage": j.get("coverage") or "N/A",
+            "source_type": j.get("source_type") or "N/A"
         }
         final_records.append(rec)
 
@@ -323,16 +362,29 @@ def run_pipeline():
     pd.DataFrame(final_records).to_csv(backup_file, index=False)
     print(f"      [+] Saved local backup CSV to '{backup_file}'.", flush=True)
 
+    # Check which optional columns exist in Supabase (status, coverage, source_type)
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    supported_cols = set(["journal_id", "journal_name", "issn", "e_issn", "publisher", "subject_area", "citescore", "sjr", "snip"])
+    for col in ["status", "coverage", "source_type"]:
+        rc = requests.get(f"{SUPABASE_URL}/rest/v1/Scopus_additional_data?select={col}&limit=1", headers=headers)
+        if rc.status_code == 200:
+            supported_cols.add(col)
+
+    records_to_upload = [
+        {k: v for k, v in r.items() if k in supported_cols}
+        for r in final_records
+    ]
+
     # Batch upload to Supabase
     table_name = "Scopus_additional_data"
     batch_upload_size = 500
-    total = len(final_records)
+    total = len(records_to_upload)
     uploaded = 0
 
     print(f"      Uploading {total} records to '{table_name}' in chunks of {batch_upload_size} ...", flush=True)
 
     for i in range(0, total, batch_upload_size):
-        chunk = final_records[i : i + batch_upload_size]
+        chunk = records_to_upload[i : i + batch_upload_size]
         batch_num = (i // batch_upload_size) + 1
         total_batches = (total + batch_upload_size - 1) // batch_upload_size
 

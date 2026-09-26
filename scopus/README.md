@@ -8,15 +8,16 @@ This module fetches real-time Scopus metrics (**CiteScore**, **SJR**, **SNIP**, 
 
 | File | Description |
 | :--- | :--- |
-| `fetch_and_push_12k.py` | Main end-to-end pipeline: fetches journals from `journals`, maps against Scopus registry, streams metrics in bulk, saves CSV backup, and upserts to `Scopus_additional_data`. |
-| `scrape_historical_metrics.py` | Scrapes official historical CiteScore, SJR, and SNIP from Scopus for inactive/discontinued journals and synchronizes `status` column (`active`/`inactive`). |
+| `fetch_and_push_12k.py` | Main end-to-end pipeline: fetches journals from `journals`, maps against Scopus registry, streams metrics in bulk, extracts coverage years and source type, saves CSV backup, and upserts to `Scopus_additional_data`. |
+| `push_coverage_and_source_type.py` | Dedicated utility to batch upsert `coverage` ("Years currently covered by Scopus") and `source_type` ("Source type") into Supabase `Scopus_additional_data`. |
+| `scrape_historical_metrics.py` | Scrapes official historical CiteScore, SJR, and SNIP from Scopus for inactive/discontinued journals and synchronizes `status`, `coverage`, and `source_type`. |
 | `complete_missing_metrics.py` | Resumption script: streams full catalog (offsets 17,200 – 50,040) with rate-limit protection to recover all remaining journal metrics. |
 | `scrape_scopus.py` | Standalone browser/dynamic scraper using `Scrapling` for detailed Scopus web profile scraping. |
 | `push_to_supabase.py` | Utility to push local CSV data directly into Supabase tables in batches. |
-| `setup_supabase_table.sql` | SQL schema migration creating the `Scopus_additional_data` table, indexes, unique constraints, RLS policies, and `status` column. |
+| `setup_supabase_table.sql` | SQL schema migration creating the `Scopus_additional_data` table, indexes, unique constraints, RLS policies, `status`, `coverage`, and `source_type` columns. |
 | `schema.sql` | Base schema reference for the Supabase database. |
-| `scopus_12k_additional_data.csv`| Enriched dataset of 12,196 journals with Scopus CiteScore, SJR, SNIP, publisher, subject area, and `status` (`active`/`inactive`). |
-| `journals_with_at_least_one_null_metric.csv` | List of 419 journals marked as `inactive` (containing populated historical metrics or partial coverage). |
+| `scopus_12k_additional_data.csv`| Enriched dataset of 12,196 journals with Scopus CiteScore, SJR, SNIP, publisher, subject area, `status` (`active`/`inactive`), `coverage` (e.g. `from 1990 to 2026`), and `source_type` (e.g. `Journal`). |
+| `journals_with_at_least_one_null_metric.csv` | List of 419 journals marked as `inactive` (containing populated historical metrics or partial coverage) with coverage and source type. |
 | `journals_with_null_metrics.csv` | List of 34 unindexed/unmapped journals where no metrics exist on Scopus. |
 | `matched_journals.csv` | Initial mapping of Supabase journals to Scopus Sourcerecord IDs via normalized ISSN / E-ISSN. |
 | `scopus_journals.csv` | Sample verification dataset of top Scopus journals. |
